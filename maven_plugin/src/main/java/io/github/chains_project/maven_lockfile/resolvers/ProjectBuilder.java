@@ -13,6 +13,7 @@ import org.apache.maven.artifact.repository.ArtifactRepository;
 import org.apache.maven.execution.MavenSession;
 import org.apache.maven.plugin.logging.Log;
 import org.apache.maven.project.*;
+import org.apache.maven.model.building.ModelBuildingRequest;
 import org.apache.maven.shared.transfer.artifact.resolve.ArtifactResolver;
 import org.apache.maven.shared.transfer.artifact.resolve.ArtifactResolverException;
 import org.apache.maven.shared.transfer.artifact.resolve.ArtifactResult;
@@ -102,7 +103,8 @@ public class ProjectBuilder {
         ProjectBuildingRequest buildingRequest = new DefaultProjectBuildingRequest(session.getProjectBuildingRequest());
         buildingRequest.setRemoteRepositories(repositories);
         buildingRequest.setProcessPlugins(false);
-        buildingRequest.setResolveDependencies(true);
+        buildingRequest.setResolveDependencies(false);
+        buildingRequest.setValidationLevel(ModelBuildingRequest.VALIDATION_LEVEL_MINIMAL);
 
         try {
             // Note: getContainer() is deprecated but there's no clear replacement in the current Maven API

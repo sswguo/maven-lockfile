@@ -12,6 +12,7 @@ import io.github.chains_project.maven_lockfile.data.MavenScope;
 import io.github.chains_project.maven_lockfile.data.VersionNumber;
 import io.github.chains_project.maven_lockfile.reporting.PluginLogManager;
 import java.util.*;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.apache.maven.shared.dependency.graph.internal.SpyingDependencyNodeUtils;
 
@@ -54,6 +55,43 @@ public class DependencyGraph {
 
     public Optional<DependencyNode> getParentForNode(DependencyNode node) {
         return graph.stream().filter(n -> n.id.equals(node.getParent())).findFirst();
+    }
+
+    /**
+     * For conflict-loser nodes (included=false) whose children were pruned by Maven's dependency
+     * resolver, independently resolve and populate their subtrees. Maven's resolver prunes the
+     * subtrees of conflict losers, but their transitive POMs still need to be present in the local
+     * repository for offline resolution to work.
+     *
+     * @param childrenProvider a function that, given a conflict-loser node, returns its resolved children
+     */
+    public void populateChildrenForConflictLosers(Function<DependencyNode, Set<DependencyNode>> childrenProvider) {
+        for (DependencyNode root : new ArrayList<>(graph)) {
+            populateChildrenForConflictLosersRecursive(root, childrenProvider);
+        }
+    }
+
+    private void populateChildrenForConflictLosersRecursive(
+            DependencyNode node, Function<DependencyNode, Set<DependencyNode>> childrenProvider) {
+        if (!node.isIncluded() && node.getChildren().isEmpty()) {
+            PluginLogManager.getLog().debug(String.format(
+                    "Resolving children for conflict-loser node %s:%s:%s",
+                    node.getGroupId().getValue(), node.getArtifactId().getValue(), node.getVersion().getValue()));
+            Set<DependencyNode> children = childrenProvider.apply(node);
+            for (DependencyNode child : children) {
+                try {
+                    node.addChild(child);
+                } catch (Exception e) {
+                    PluginLogManager.getLog().debug(String.format(
+                            "Could not add child %s to conflict-loser node %s", child, node), e);
+                }
+            }
+        }
+        // Recurse into children (use a snapshot to avoid ConcurrentModificationException
+        // if addChild above added new children to a sibling)
+        for (DependencyNode child : new ArrayList<>(node.getChildren())) {
+            populateChildrenForConflictLosersRecursive(child, childrenProvider);
+        }
     }
 
     public static DependencyGraph of(

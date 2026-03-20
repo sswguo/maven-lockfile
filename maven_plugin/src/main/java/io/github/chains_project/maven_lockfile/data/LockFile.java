@@ -41,6 +41,10 @@ public class LockFile {
 
     private final Set<MavenPlugin> mavenPlugins;
 
+    private final Set<Pom> boms;
+
+    private final Set<Extension> extensions;
+
     private final MetaData metaData;
 
     public LockFile(
@@ -50,6 +54,8 @@ public class LockFile {
             Pom pom,
             Set<DependencyNode> dependencies,
             Set<MavenPlugin> mavenPlugins,
+            Set<Pom> boms,
+            Set<Extension> extensions,
             MetaData metaData) {
         this.groupId = groupId;
         this.name = name;
@@ -57,6 +63,8 @@ public class LockFile {
         this.pom = pom;
         this.dependencies = dependencies == null ? Collections.emptySet() : dependencies;
         this.mavenPlugins = mavenPlugins == null ? Collections.emptySet() : mavenPlugins;
+        this.boms = boms == null ? Collections.emptySet() : boms;
+        this.extensions = extensions == null ? Collections.emptySet() : extensions;
         this.metaData = metaData;
     }
     /**
@@ -108,6 +116,10 @@ public class LockFile {
     public Set<MavenPlugin> getMavenPlugins() {
         return nullToEmpty(mavenPlugins);
     }
+
+    public Set<Pom> getBoms() { return nullToEmpty(boms); }
+
+    public Set<Extension> getExtensions() { return nullToEmpty(extensions); }
     /**
      * @return the metadata about the environment in which the lock file was generated
      */

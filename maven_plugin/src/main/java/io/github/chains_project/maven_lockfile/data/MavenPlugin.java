@@ -4,6 +4,7 @@ import io.github.chains_project.maven_lockfile.graph.DependencyNode;
 import java.util.Collections;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * This class represents a maven plugin. It contains a group id, an artifact id, and a version number. A plugin is uniquely identified by its group id, artifact id, and version number.
@@ -19,6 +20,8 @@ public class MavenPlugin implements Comparable<MavenPlugin> {
     private final ResolvedUrl resolved;
     private final RepositoryId repositoryId;
     private final Set<DependencyNode> dependencies;
+    private final Pom pom;
+    private final Set<Pom> boms;
 
     public MavenPlugin(
             GroupId groupId,
@@ -28,7 +31,7 @@ public class MavenPlugin implements Comparable<MavenPlugin> {
             RepositoryId repositoryId,
             String checksumAlgorithm,
             String checksum) {
-        this(groupId, artifactId, version, resolvedUrl, repositoryId, checksumAlgorithm, checksum, null);
+        this(groupId, artifactId, version, resolvedUrl, repositoryId, checksumAlgorithm, checksum, null, null);
     }
 
     public MavenPlugin(
@@ -40,6 +43,33 @@ public class MavenPlugin implements Comparable<MavenPlugin> {
             String checksumAlgorithm,
             String checksum,
             Set<DependencyNode> dependencies) {
+        this(groupId, artifactId, version, resolvedUrl, repositoryId, checksumAlgorithm, checksum, dependencies, null);
+    }
+
+    public MavenPlugin(
+            GroupId groupId,
+            ArtifactId artifactId,
+            VersionNumber version,
+            ResolvedUrl resolvedUrl,
+            RepositoryId repositoryId,
+            String checksumAlgorithm,
+            String checksum,
+            Set<DependencyNode> dependencies,
+            Pom pom) {
+        this(groupId, artifactId, version, resolvedUrl, repositoryId, checksumAlgorithm, checksum, dependencies, pom, null);
+    }
+
+    public MavenPlugin(
+            GroupId groupId,
+            ArtifactId artifactId,
+            VersionNumber version,
+            ResolvedUrl resolvedUrl,
+            RepositoryId repositoryId,
+            String checksumAlgorithm,
+            String checksum,
+            Set<DependencyNode> dependencies,
+            Pom pom,
+            Set<Pom> boms) {
         this.groupId = groupId;
         this.artifactId = artifactId;
         this.version = version;
@@ -48,6 +78,8 @@ public class MavenPlugin implements Comparable<MavenPlugin> {
         this.checksumAlgorithm = checksumAlgorithm;
         this.checksum = checksum;
         this.dependencies = dependencies == null ? Collections.emptySet() : dependencies;
+        this.pom = pom;
+        this.boms = boms == null ? Collections.emptySet() : new TreeSet<>(boms);
     }
 
     public GroupId getGroupId() {
@@ -83,6 +115,14 @@ public class MavenPlugin implements Comparable<MavenPlugin> {
      */
     public Set<DependencyNode> getDependencies() {
         return dependencies;
+    }
+
+    public Pom getPom() {
+        return pom;
+    }
+
+    public Set<Pom> getBoms() {
+        return boms;
     }
 
     @Override

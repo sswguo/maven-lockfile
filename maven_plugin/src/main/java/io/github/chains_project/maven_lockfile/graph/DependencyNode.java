@@ -42,6 +42,8 @@ public class DependencyNode implements Comparable<DependencyNode> {
 
     private Set<Pom> boms;
 
+    private Pom pom;
+
     DependencyNode(
             ArtifactId artifactId,
             GroupId groupId,
@@ -143,6 +145,14 @@ public class DependencyNode implements Comparable<DependencyNode> {
         this.boms = boms;
     }
 
+    public void setPom(Pom pom) {
+        this.pom = pom;
+    }
+
+    public Pom getPom() {
+        return pom;
+    }
+
     /**
      * @return the children
      */
@@ -204,7 +214,8 @@ public class DependencyNode implements Comparable<DependencyNode> {
                 id,
                 parent,
                 children,
-                boms);
+                boms,
+                pom);
     }
 
     @Override
@@ -228,7 +239,8 @@ public class DependencyNode implements Comparable<DependencyNode> {
                 && Objects.equals(id, other.id)
                 && Objects.equals(parent, other.parent)
                 && Objects.equals(children, other.children)
-                && Objects.equals(boms, other.boms);
+                && Objects.equals(boms, other.boms)
+                && Objects.equals(pom, other.pom);
     }
 
     @Override
