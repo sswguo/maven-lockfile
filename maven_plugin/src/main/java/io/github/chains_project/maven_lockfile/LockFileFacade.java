@@ -458,9 +458,32 @@ public class LockFileFacade {
         try {
             ProjectBuildingRequest buildingRequest =
                     new DefaultProjectBuildingRequest(session.getProjectBuildingRequest());
-
             buildingRequest.setProject(project);
-            var rootNode = dependencyCollectorBuilder.collectDependencyGraph(buildingRequest, null);
+
+            // Build the set of reactor (inter-module) sibling GAVs. These are built locally
+            // during the same Maven invocation and have no remote URL — Maven cannot resolve
+            // them from remote repositories, so we must exclude them from dependency collection
+            // entirely to prevent a DependencyCollectorBuilderException.
+            Set<String> reactorGavs = session.getProjects().stream()
+                    .map(p -> p.getGroupId() + ":" + p.getArtifactId() + ":" + p.getVersion())
+                    .collect(Collectors.toSet());
+            // Remove the current module itself — it is the root of the graph, not a sibling
+            reactorGavs.remove(project.getGroupId() + ":" + project.getArtifactId() + ":" + project.getVersion());
+
+            // Pass a filter to collectDependencyGraph so Maven skips reactor modules during
+            // dependency collection. Without this, Maven tries to resolve them from remote
+            // repos and fails with "Could not resolve dependencies".
+            ArtifactFilter reactorFilter = reactorGavs.isEmpty() ? null : artifact -> {
+                String gav = artifact.getGroupId() + ":" + artifact.getArtifactId() + ":" + artifact.getVersion();
+                boolean isReactor = reactorGavs.contains(gav);
+                if (isReactor) {
+                    PluginLogManager.getLog().info(String.format(
+                            "Skipping reactor (inter-module) dependency %s from lockfile", gav));
+                }
+                return !isReactor;
+            };
+
+            var rootNode = dependencyCollectorBuilder.collectDependencyGraph(buildingRequest, reactorFilter);
 
             MutableGraph<DependencyNode> graph = GraphBuilder.directed().build();
             rootNode.accept(new GraphBuildingNodeVisitor(graph));
@@ -468,6 +491,7 @@ public class LockFileFacade {
                     .info(String.format(
                             "Resolved %4d dependencies for project %s",
                             graph.nodes().size(), project));
+
             return DependencyGraph.of(graph, checksumCalculator, reduced);
         } catch (Exception e) {
             PluginLogManager.getLog().warn("Could not generate graph", e);
