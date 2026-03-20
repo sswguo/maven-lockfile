@@ -97,66 +97,65 @@ public class LockFileFacade {
             AbstractChecksumCalculator checksumCalculator,
             MetaData metadata) {
         PluginLogManager.getLog().info(String.format("Generating lock file for project %s", project.getArtifactId()));
+
         Set<MavenPlugin> plugins = new TreeSet<>();
         if (metadata.getConfig().isIncludeMavenPlugins()) {
             plugins = getAllPlugins(project, session, dependencyCollectorBuilder, checksumCalculator);
         }
-        var graph = LockFileFacade.graph(
-                session,
-                project,
-                dependencyCollectorBuilder,
-                checksumCalculator,
+
+        var graph = buildDependencyGraph(session, project, dependencyCollectorBuilder, checksumCalculator,
                 metadata.getConfig().isReduced());
-        var roots = graph.getGraph().stream()
-                .filter(v -> v.getParent() == null)
-                .collect(Collectors.toCollection(() -> new TreeSet<>(Comparator.comparing(
-                        io.github.chains_project.maven_lockfile.graph.DependencyNode::getComparatorString))));
-        var pom = constructRecursivePom(project, checksumCalculator);
-        var rootBoms = new TreeSet<Pom>();
-        resolveBoms(session, project, checksumCalculator, rootBoms);
         resolveNodeParents(graph, session, project.getRemoteArtifactRepositories(), checksumCalculator);
-        var extensions = new TreeSet<Extension>();
-        resolveExtensions(session, project, dependencyCollectorBuilder, checksumCalculator, extensions);
+
         return new LockFile(
                 GroupId.of(project.getGroupId()),
                 ArtifactId.of(project.getArtifactId()),
                 VersionNumber.of(project.getVersion()),
-                pom,
-                roots,
+                constructProjectPomChain(project, checksumCalculator),
+                graph.getRoots(),
                 plugins,
-                rootBoms,
-                extensions,
+                resolveBoms(session, project, checksumCalculator),
+                resolveExtensions(session, project, dependencyCollectorBuilder, checksumCalculator),
                 metadata);
     }
 
-    private static void resolveExtensions(
+    private static Set<Extension> resolveExtensions(
             MavenSession session,
             MavenProject project,
             DependencyCollectorBuilder dependencyCollectorBuilder,
-            AbstractChecksumCalculator checksumCalculator,
-            TreeSet<Extension> extensions) {
+            AbstractChecksumCalculator checksumCalculator) {
         var buildExtensions = project.getBuild().getExtensions();
         PluginLogManager.getLog().info(String.format(
                 "Resolving %d build extension(s) for project %s", buildExtensions.size(), project.getArtifactId()));
+
         ProjectBuilder projectBuilder = new ProjectBuilder(session, project.getPluginArtifactRepositories());
-        BomResolver extBomResolver = new BomResolver(session, project.getPluginArtifactRepositories(), checksumCalculator);
+        BomResolver bomResolver = new BomResolver(session, project.getPluginArtifactRepositories(), checksumCalculator);
+        Set<Extension> extensions = new TreeSet<>();
+
         for (org.apache.maven.model.Extension ext : buildExtensions) {
             PluginLogManager.getLog().info(String.format(
                     "Resolving extension %s:%s:%s", ext.getGroupId(), ext.getArtifactId(), ext.getVersion()));
+
             Artifact artifact = new DefaultArtifact(
-                    ext.getGroupId(), ext.getArtifactId(), ext.getVersion(), "compile", "jar", null, new DefaultArtifactHandler("jar"));
+                    ext.getGroupId(), ext.getArtifactId(), ext.getVersion(),
+                    "compile", "jar", null, new DefaultArtifactHandler("jar"));
             RepositoryInformation repoInfo = checksumCalculator.getPluginResolvedField(artifact);
             String checksum = checksumCalculator.calculatePluginChecksum(artifact);
             Set<io.github.chains_project.maven_lockfile.graph.DependencyNode> deps =
-                    resolvePluginDependencies(artifact, session, project, dependencyCollectorBuilder, checksumCalculator, Collections.emptyList());
-            Optional<MavenProject> extProjectOpt = projectBuilder.buildFromGav(ext.getGroupId(), ext.getArtifactId(), ext.getVersion());
-            Pom pom = extProjectOpt.map(extProject -> resolveParentChain(extProject, checksumCalculator)).orElse(null);
-            Set<Pom> extBoms = extProjectOpt.map(extBomResolver::resolveForProject).orElse(Collections.emptySet());
+                    resolvePluginDependencies(artifact, session, project, dependencyCollectorBuilder, checksumCalculator,
+                            Collections.emptyList());
+
+            Optional<MavenProject> extProjectOpt = projectBuilder.buildFromGav(
+                    ext.getGroupId(), ext.getArtifactId(), ext.getVersion());
+            Pom pom = extProjectOpt.map(p -> resolveParentChain(p, checksumCalculator)).orElse(null);
+            Set<Pom> extBoms = extProjectOpt.map(bomResolver::resolveForProject).orElse(Collections.emptySet());
+
             PluginLogManager.getLog().info(String.format(
                     "Resolved extension %s:%s:%s -> url=%s, repo=%s, checksum=%s, dependencies=%d, pom=%s",
                     ext.getGroupId(), ext.getArtifactId(), ext.getVersion(),
                     repoInfo.getResolvedUrl(), repoInfo.getRepositoryId(), checksum, deps.size(),
                     pom != null ? pom.getChecksum() : "unresolved"));
+
             extensions.add(new Extension(
                     GroupId.of(ext.getGroupId()),
                     ArtifactId.of(ext.getArtifactId()),
@@ -170,16 +169,21 @@ public class LockFileFacade {
                     pom,
                     extBoms));
         }
+        return extensions;
     }
 
+    /**
+     * Resolve the parent POM chain of a dependency (or plugin/extension) project as a linked {@link Pom} chain.
+     * Always resolves as POM-type artifacts regardless of the project's packaging
+     * (e.g. Guava has type=bundle, but the file hermeto needs is the .pom).
+     */
     private static Pom resolveParentChain(MavenProject start, AbstractChecksumCalculator checksumCalculator) {
         List<MavenProject> chain = new ArrayList<>();
-        MavenProject current = start;
-        while (current != null) {
-            chain.add(current);
-            current = current.hasParent() ? current.getParent() : null;
+        for (MavenProject p = start; p != null; p = p.hasParent() ? p.getParent() : null) {
+            chain.add(p);
         }
-        Collections.reverse(chain);
+        Collections.reverse(chain); // root-first so each entry becomes the parent of the next
+
         Pom pom = null;
         for (MavenProject p : chain) {
             // Always resolve as a POM artifact regardless of the project's packaging type
@@ -191,58 +195,69 @@ public class LockFileFacade {
             String checksum = checksumCalculator.calculateArtifactChecksum(pomArtifact);
             PluginLogManager.getLog().debug(String.format("Resolved parent %s:%s:%s -> checksum=%s",
                     p.getGroupId(), p.getArtifactId(), p.getVersion(), checksum));
-            pom = new Pom(
-                    GroupId.of(p.getGroupId()),
-                    ArtifactId.of(p.getArtifactId()),
-                    VersionNumber.of(p.getVersion()),
-                    null,
-                    repoInfo.getResolvedUrl(),
-                    repoInfo.getRepositoryId(),
-                    checksumCalculator.getChecksumAlgorithm(),
-                    checksum,
-                    pom);
+            pom = new Pom(GroupId.of(p.getGroupId()), ArtifactId.of(p.getArtifactId()),
+                    VersionNumber.of(p.getVersion()), null,
+                    repoInfo.getResolvedUrl(), repoInfo.getRepositoryId(),
+                    checksumCalculator.getChecksumAlgorithm(), checksum, pom);
         }
         return pom;
     }
 
+    /**
+     * Attaches a POM parent chain and BOM imports to every node in the dependency graph.
+     * Results are cached by GAV so each unique artifact is resolved at most once.
+     */
     @SuppressWarnings("deprecation")
     private static void resolveNodeParents(
             DependencyGraph graph,
             MavenSession session,
             List<org.apache.maven.artifact.repository.ArtifactRepository> repositories,
             AbstractChecksumCalculator checksumCalculator) {
-        ProjectBuilder projectBuilder = new ProjectBuilder(session, repositories);
-        BomResolver bomResolver = new BomResolver(session, repositories, checksumCalculator);
-        Map<String, Optional<MavenProject>> projectCache = new HashMap<>();
-        Map<String, Pom> pomChainCache = new HashMap<>();
-        Map<String, Set<Pom>> bomsCache = new HashMap<>();
-        graph.getGraph().forEach(node -> resolveNodeParentsRecursive(node, projectBuilder, bomResolver, checksumCalculator, projectCache, pomChainCache, bomsCache));
+        var resolver = new NodeParentResolver(session, repositories, checksumCalculator);
+        graph.getGraph().forEach(resolver::resolve);
     }
 
-    private static void resolveNodeParentsRecursive(
-            io.github.chains_project.maven_lockfile.graph.DependencyNode node,
-            ProjectBuilder projectBuilder,
-            BomResolver bomResolver,
-            AbstractChecksumCalculator checksumCalculator,
-            Map<String, Optional<MavenProject>> projectCache,
-            Map<String, Pom> pomChainCache,
-            Map<String, Set<Pom>> bomsCache) {
-        String key = node.getGroupId().getValue() + ":" + node.getArtifactId().getValue() + ":" + node.getVersion().getValue();
-        Optional<MavenProject> projectOptional = projectCache.computeIfAbsent(key, k -> {
-            PluginLogManager.getLog().debug(String.format("Resolving parent chain for dependency %s", key));
-            return projectBuilder.buildFromGav(
-                    node.getGroupId().getValue(),
-                    node.getArtifactId().getValue(),
-                    node.getVersion().getValue());
-        });
-        projectOptional.ifPresent(p -> {
-            node.setPom(pomChainCache.computeIfAbsent(key, k -> resolveParentChain(p, checksumCalculator)));
-            Set<Pom> boms = bomsCache.computeIfAbsent(key, k -> bomResolver.resolveForProject(p));
-            if (!boms.isEmpty()) {
-                node.setBoms(boms);
-            }
-        });
-        node.getChildren().forEach(child -> resolveNodeParentsRecursive(child, projectBuilder, bomResolver, checksumCalculator, projectCache, pomChainCache, bomsCache));
+    /**
+     * Stateful helper that resolves POM parent chains and BOM imports for dependency nodes.
+     * Caches {@link MavenProject} lookups, POM chains, and BOM sets by GAV to avoid redundant
+     * remote calls when multiple nodes share the same parent or BOM.
+     */
+    private static final class NodeParentResolver {
+        private final ProjectBuilder projectBuilder;
+        private final BomResolver bomResolver;
+        private final AbstractChecksumCalculator checksumCalculator;
+        private final Map<String, Optional<MavenProject>> projectCache = new HashMap<>();
+        private final Map<String, Pom> pomChainCache = new HashMap<>();
+        private final Map<String, Set<Pom>> bomsCache = new HashMap<>();
+
+        NodeParentResolver(MavenSession session,
+                @SuppressWarnings("deprecation") List<org.apache.maven.artifact.repository.ArtifactRepository> repositories,
+                AbstractChecksumCalculator checksumCalculator) {
+            this.projectBuilder = new ProjectBuilder(session, repositories);
+            this.bomResolver = new BomResolver(session, repositories, checksumCalculator);
+            this.checksumCalculator = checksumCalculator;
+        }
+
+        void resolve(io.github.chains_project.maven_lockfile.graph.DependencyNode node) {
+            String gav = node.getGroupId().getValue() + ":" + node.getArtifactId().getValue()
+                    + ":" + node.getVersion().getValue();
+
+            Optional<MavenProject> project = projectCache.computeIfAbsent(gav, k -> {
+                PluginLogManager.getLog().debug(String.format("Resolving parent chain for dependency %s", gav));
+                return projectBuilder.buildFromGav(
+                        node.getGroupId().getValue(), node.getArtifactId().getValue(), node.getVersion().getValue());
+            });
+
+            project.ifPresent(p -> {
+                node.setPom(pomChainCache.computeIfAbsent(gav, k -> resolveParentChain(p, checksumCalculator)));
+                Set<Pom> boms = bomsCache.computeIfAbsent(gav, k -> bomResolver.resolveForProject(p));
+                if (!boms.isEmpty()) {
+                    node.setBoms(boms);
+                }
+            });
+
+            node.getChildren().forEach(this::resolve);
+        }
     }
 
     private static Set<MavenPlugin> getAllPlugins(
@@ -330,36 +345,10 @@ public class LockFileFacade {
                     .debug(String.format(
                             "Built plugin project %s with %d declared dependencies", pluginArtifact, declaredDeps));
 
-            // Merge user-declared dependencies into the plugin project
-            // User-declared dependencies override the plugin's default dependencies (e.g., scope changes)
+            // User-declared plugin dependencies (from <plugin><dependencies> in pom.xml) override
+            // the plugin's built-in defaults — e.g. to change scope or pin a version.
             if (!userDeclaredDeps.isEmpty()) {
-                List<Dependency> pluginDeps = new ArrayList<>(pluginProject.getDependencies());
-                Map<String, Dependency> existingDepsMap = new HashMap<>();
-                for (Dependency dep : pluginDeps) {
-                    String key = dep.getGroupId() + ":" + dep.getArtifactId();
-                    existingDepsMap.put(key, dep);
-                }
-
-                for (Dependency userDep : userDeclaredDeps) {
-                    String key = userDep.getGroupId() + ":" + userDep.getArtifactId();
-                    if (existingDepsMap.containsKey(key)) {
-                        pluginDeps.remove(existingDepsMap.get(key));
-                        PluginLogManager.getLog()
-                                .debug(String.format(
-                                        "Overriding plugin dependency %s with user-declared dependency (scope: %s -> %s)",
-                                        key, existingDepsMap.get(key).getScope(), userDep.getScope()));
-                    } else {
-                        PluginLogManager.getLog()
-                                .debug(String.format(
-                                        "Adding user-declared dependency %s to plugin %s", key, pluginArtifact));
-                    }
-                    pluginDeps.add(userDep);
-                }
-                pluginProject.setDependencies(pluginDeps);
-                PluginLogManager.getLog()
-                        .debug(String.format(
-                                "Plugin %s now has %d dependencies after merging user-declared dependencies",
-                                pluginArtifact, pluginDeps.size()));
+                mergeUserDeclaredDeps(pluginProject, userDeclaredDeps, pluginArtifact);
             }
 
             ProjectBuildingRequest dependencyBuildingRequest =
@@ -427,7 +416,40 @@ public class LockFileFacade {
         }
     }
 
-    private static DependencyGraph graph(
+    /**
+     * Merges user-declared plugin dependencies (from the project's {@code <plugin><dependencies>})
+     * into the plugin project's dependency list. User entries override built-in defaults by GA key;
+     * new entries are appended.
+     */
+    private static void mergeUserDeclaredDeps(
+            MavenProject pluginProject, List<Dependency> userDeclaredDeps, Artifact pluginArtifact) {
+        List<Dependency> pluginDeps = new ArrayList<>(pluginProject.getDependencies());
+        Map<String, Dependency> existingByGa = new HashMap<>();
+        for (Dependency dep : pluginDeps) {
+            existingByGa.put(dep.getGroupId() + ":" + dep.getArtifactId(), dep);
+        }
+
+        for (Dependency userDep : userDeclaredDeps) {
+            String ga = userDep.getGroupId() + ":" + userDep.getArtifactId();
+            Dependency existing = existingByGa.get(ga);
+            if (existing != null) {
+                pluginDeps.remove(existing);
+                PluginLogManager.getLog().debug(String.format(
+                        "Overriding plugin dependency %s (scope: %s -> %s)", ga, existing.getScope(), userDep.getScope()));
+            } else {
+                PluginLogManager.getLog().debug(String.format(
+                        "Adding user-declared dependency %s to plugin %s", ga, pluginArtifact));
+            }
+            pluginDeps.add(userDep);
+        }
+
+        pluginProject.setDependencies(pluginDeps);
+        PluginLogManager.getLog().debug(String.format(
+                "Plugin %s now has %d dependencies after merging user-declared dependencies",
+                pluginArtifact, pluginDeps.size()));
+    }
+
+    private static DependencyGraph buildDependencyGraph(
             MavenSession session,
             MavenProject project,
             DependencyCollectorBuilder dependencyCollectorBuilder,
@@ -454,75 +476,55 @@ public class LockFileFacade {
     }
 
     /**
-     * Construct a Pom object containing a full tree of its parent POM references. These parent
-     * POMs may be relative to the project being built, or are specified from an external POM.
+     * Build a linked {@link Pom} chain for the root project's own parent hierarchy.
+     * Each entry is either:
+     * <ul>
+     *   <li>A <b>local POM</b> (file exists on disk) — checksummed from the file, stored with a
+     *       relative path, no resolved URL.</li>
+     *   <li>An <b>external POM</b> (no local file) — resolved from a remote repository, stored
+     *       with a resolved URL and repository ID.</li>
+     * </ul>
      */
-    private static Pom constructRecursivePom(
+    private static Pom constructProjectPomChain(
             MavenProject initialProject, AbstractChecksumCalculator checksumCalculator) {
-        String checksumAlgorithm = checksumCalculator.getChecksumAlgorithm();
-
-        List<MavenProject> recursiveProjects = new ArrayList<>();
-        MavenProject currentProject = initialProject;
-        recursiveProjects.add(currentProject);
-        while (currentProject.hasParent()) {
-            currentProject = currentProject.getParent();
-            recursiveProjects.add(currentProject);
+        // Collect chain from project up to root ancestor, then reverse to build root-first
+        List<MavenProject> chain = new ArrayList<>();
+        for (MavenProject p = initialProject; p != null; p = p.hasParent() ? p.getParent() : null) {
+            chain.add(p);
         }
+        Collections.reverse(chain);
 
-        Pom lastPom = null;
-        Collections.reverse(recursiveProjects);
-        for (MavenProject project : recursiveProjects) {
-            String relativePath = project.getFile() == null
-                    ? null
-                    : initialProject
-                            .getBasedir()
-                            .toPath()
-                            .relativize(project.getFile().toPath())
-                            .toString();
-            String checksum = null;
-            ResolvedUrl resolved = null;
-            RepositoryId repoId = null;
-            if (project.getFile() == null) {
-                // External POM - get repository information
+        Pom pom = null;
+        for (MavenProject project : chain) {
+            if (project.getFile() != null) {
+                // Local POM — checksum from file on disk, relativePath for identification
+                String relativePath = initialProject.getBasedir().toPath()
+                        .relativize(project.getFile().toPath()).toString();
+                String checksum = checksumCalculator.calculatePomChecksum(project.getFile().toPath());
+                pom = new Pom(GroupId.of(project.getGroupId()), ArtifactId.of(project.getArtifactId()),
+                        VersionNumber.of(project.getVersion()), relativePath,
+                        null, null, checksumCalculator.getChecksumAlgorithm(), checksum, pom);
+            } else {
+                // External POM — resolve URL and checksum from remote repository
                 Artifact artifact = project.getArtifact();
                 Artifact pomArtifact = new DefaultArtifact(
-                        artifact.getGroupId(),
-                        artifact.getArtifactId(),
-                        artifact.getVersion(),
-                        artifact.getScope(),
-                        "pom",
-                        artifact.getClassifier(),
-                        artifact.getArtifactHandler());
-                checksum = checksumCalculator.calculateArtifactChecksum(pomArtifact);
+                        artifact.getGroupId(), artifact.getArtifactId(), artifact.getVersion(),
+                        artifact.getScope(), "pom", artifact.getClassifier(), artifact.getArtifactHandler());
+                String checksum = checksumCalculator.calculateArtifactChecksum(pomArtifact);
                 RepositoryInformation repoInfo = checksumCalculator.getArtifactResolvedField(pomArtifact);
-                resolved = repoInfo.getResolvedUrl();
-                repoId = repoInfo.getRepositoryId();
-            } else {
-                checksum = checksumCalculator.calculatePomChecksum(
-                        project.getFile().toPath());
+                pom = new Pom(GroupId.of(project.getGroupId()), ArtifactId.of(project.getArtifactId()),
+                        VersionNumber.of(project.getVersion()), null,
+                        repoInfo.getResolvedUrl(), repoInfo.getRepositoryId(),
+                        checksumCalculator.getChecksumAlgorithm(), checksum, pom);
             }
-            lastPom = new Pom(
-                    GroupId.of(project.getGroupId()),
-                    ArtifactId.of(project.getArtifactId()),
-                    VersionNumber.of(project.getVersion()),
-                    relativePath,
-                    resolved,
-                    repoId,
-                    checksumAlgorithm,
-                    checksum,
-                    lastPom);
         }
-
-        return lastPom;
+        return pom;
     }
 
-    private static void resolveBoms(
-            MavenSession session,
-            MavenProject rootProject,
-            AbstractChecksumCalculator checksumCalculator,
-            Set<Pom> rootBoms) {
+    private static Set<Pom> resolveBoms(
+            MavenSession session, MavenProject rootProject, AbstractChecksumCalculator checksumCalculator) {
         BomResolver bomResolver =
                 new BomResolver(session, rootProject.getRemoteArtifactRepositories(), checksumCalculator);
-        rootBoms.addAll(bomResolver.resolveForProject(rootProject));
+        return bomResolver.resolveForProject(rootProject);
     }
 }

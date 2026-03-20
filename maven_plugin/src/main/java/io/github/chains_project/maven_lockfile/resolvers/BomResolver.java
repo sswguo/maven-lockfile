@@ -129,31 +129,23 @@ public class BomResolver {
         return version;
     }
 
+    /**
+     * Build a linked {@link Pom} chain from the BOM's own parent hierarchy.
+     * The chain is built root-first so each entry references its ancestor as {@code parent}.
+     */
     private Pom resolveBomParents(MavenProject start) {
-        List<MavenProject> projects = new ArrayList<>();
-        Pom current = null;
-
-        if (!start.hasParent()) {
-            return mavenProjectToBom(start, checksumCalculator, null);
+        // Collect chain from BOM project up to root ancestor, then reverse to build root-first
+        List<MavenProject> chain = new ArrayList<>();
+        for (MavenProject p = start; p != null; p = p.hasParent() ? p.getParent() : null) {
+            chain.add(p);
         }
+        Collections.reverse(chain);
 
-        while (start.hasParent()) {
-            projects.add(start);
-            start = start.getParent();
+        Pom pom = null;
+        for (MavenProject project : chain) {
+            pom = mavenProjectToBom(project, checksumCalculator, pom);
         }
-
-        projects.add(start);
-        Collections.reverse(projects);
-        for (MavenProject project : projects) {
-            if (current == null) {
-                current = mavenProjectToBom(project, checksumCalculator, null);
-            } else {
-                var bom = mavenProjectToBom(project, checksumCalculator, current);
-                current = bom;
-            }
-        }
-
-        return current;
+        return pom;
     }
 
     private static Pom mavenProjectToBom(
