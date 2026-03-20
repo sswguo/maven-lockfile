@@ -101,6 +101,15 @@ public class DependencyGraph {
         var roots = graph.nodes().stream()
                 .filter(it -> graph.predecessors(it).isEmpty())
                 .collect(Collectors.toList());
+
+        // Pre-warm the checksum/URL cache for all non-root artifacts in parallel before
+        // the sequential createDependencyNode traversal, so each node hits only the cache.
+        var nonRootArtifacts = graph.nodes().stream()
+                .filter(it -> !graph.predecessors(it).isEmpty())
+                .map(org.apache.maven.shared.dependency.graph.DependencyNode::getArtifact)
+                .collect(Collectors.toList());
+        calc.prewarmArtifactCache(nonRootArtifacts);
+
         Set<DependencyNode> nodes = new TreeSet<>(Comparator.comparing(DependencyNode::getComparatorString));
         for (var artifact : roots) {
             createDependencyNode(artifact, graph, calc, true, reduced).ifPresent(nodes::add);

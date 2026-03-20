@@ -5,6 +5,7 @@ import io.github.chains_project.maven_lockfile.reporting.PluginLogManager;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
+import java.util.Collection;
 import java.util.Locale;
 import org.apache.maven.artifact.Artifact;
 
@@ -25,6 +26,10 @@ public abstract class AbstractChecksumCalculator {
      */
     public String getChecksumAlgorithm() {
         return checksumAlgorithm;
+    }
+
+    public void prewarmArtifactCache(Collection<Artifact> artifacts) {
+        // no-op by default; override in remote implementations for parallel pre-warming
     }
 
     public abstract String calculateArtifactChecksum(Artifact artifact);
