@@ -16,7 +16,10 @@ import io.github.chains_project.maven_lockfile.data.ResolvedUrl;
 import io.github.chains_project.maven_lockfile.data.VersionNumber;
 import io.github.chains_project.maven_lockfile.graph.DependencyGraph;
 import io.github.chains_project.maven_lockfile.reporting.PluginLogManager;
+import io.github.chains_project.maven_lockfile.data.P2DependencyNode;
+import io.github.chains_project.maven_lockfile.data.P2Repository;
 import io.github.chains_project.maven_lockfile.resolvers.BomResolver;
+import io.github.chains_project.maven_lockfile.resolvers.P2Resolver;
 import io.github.chains_project.maven_lockfile.resolvers.ProjectBuilder;
 import java.nio.file.Path;
 import java.util.*;
@@ -121,6 +124,19 @@ public class LockFileFacade {
         artifactResolver.prewarm(graph.getGraph());
         graph.getGraph().forEach(artifactResolver::resolve);
 
+        // Resolve P2/OSGi dependencies for Tycho projects
+        List<P2DependencyNode> p2Dependencies = Collections.emptyList();
+        List<P2Repository> p2Repositories = Collections.emptyList();
+        if (P2Resolver.isTychoProject(project)) {
+            PluginLogManager.getLog().info("Tycho project detected — resolving P2 dependencies from .target files");
+            P2Resolver.P2ResolverResult p2Result = P2Resolver.resolve(project);
+            p2Dependencies = p2Result.getArtifacts();
+            p2Repositories = p2Result.getRepositories();
+            PluginLogManager.getLog().info(String.format(
+                    "Resolved %d P2 artifact(s) from %d repository(ies)",
+                    p2Dependencies.size(), p2Repositories.size()));
+        }
+
         return new LockFile(
                 GroupId.of(project.getGroupId()),
                 ArtifactId.of(project.getArtifactId()),
@@ -130,6 +146,8 @@ public class LockFileFacade {
                 plugins,
                 resolveBoms(session, project, checksumCalculator),
                 resolveExtensions(session, project, dependencyCollectorBuilder, checksumCalculator, pluginResolver),
+                p2Dependencies,
+                p2Repositories,
                 metadata);
     }
 

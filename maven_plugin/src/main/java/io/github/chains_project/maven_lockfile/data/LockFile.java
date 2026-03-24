@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 
@@ -45,6 +46,10 @@ public class LockFile {
 
     private final Set<Extension> extensions;
 
+    private final List<P2DependencyNode> p2Dependencies;
+
+    private final List<P2Repository> p2Repositories;
+
     private final MetaData metaData;
 
     public LockFile(
@@ -57,6 +62,36 @@ public class LockFile {
             Set<Pom> boms,
             Set<Extension> extensions,
             MetaData metaData) {
+        this(groupId, name, versionNumber, pom, dependencies, mavenPlugins, boms, extensions, null, metaData);
+    }
+
+    public LockFile(
+            GroupId groupId,
+            ArtifactId name,
+            VersionNumber versionNumber,
+            Pom pom,
+            Set<DependencyNode> dependencies,
+            Set<MavenPlugin> mavenPlugins,
+            Set<Pom> boms,
+            Set<Extension> extensions,
+            List<P2DependencyNode> p2Dependencies,
+            MetaData metaData) {
+        this(groupId, name, versionNumber, pom, dependencies, mavenPlugins, boms, extensions,
+                p2Dependencies, Collections.emptyList(), metaData);
+    }
+
+    public LockFile(
+            GroupId groupId,
+            ArtifactId name,
+            VersionNumber versionNumber,
+            Pom pom,
+            Set<DependencyNode> dependencies,
+            Set<MavenPlugin> mavenPlugins,
+            Set<Pom> boms,
+            Set<Extension> extensions,
+            List<P2DependencyNode> p2Dependencies,
+            List<P2Repository> p2Repositories,
+            MetaData metaData) {
         this.groupId = groupId;
         this.name = name;
         this.version = versionNumber;
@@ -65,6 +100,8 @@ public class LockFile {
         this.mavenPlugins = mavenPlugins == null ? Collections.emptySet() : mavenPlugins;
         this.boms = boms == null ? Collections.emptySet() : boms;
         this.extensions = extensions == null ? Collections.emptySet() : extensions;
+        this.p2Dependencies = p2Dependencies == null ? Collections.emptyList() : p2Dependencies;
+        this.p2Repositories = p2Repositories == null ? Collections.emptyList() : p2Repositories;
         this.metaData = metaData;
     }
     /**
@@ -120,6 +157,14 @@ public class LockFile {
     public Set<Pom> getBoms() { return nullToEmpty(boms); }
 
     public Set<Extension> getExtensions() { return nullToEmpty(extensions); }
+
+    public List<P2DependencyNode> getP2Dependencies() {
+        return p2Dependencies == null ? Collections.emptyList() : p2Dependencies;
+    }
+
+    public List<P2Repository> getP2Repositories() {
+        return p2Repositories == null ? Collections.emptyList() : p2Repositories;
+    }
     /**
      * @return the metadata about the environment in which the lock file was generated
      */
