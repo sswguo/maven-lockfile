@@ -99,6 +99,10 @@ public class RemoteChecksumCalculator extends AbstractChecksumCalculator {
                 if (checksumResponse.statusCode() >= 200 && checksumResponse.statusCode() < 300) {
                     String checksum = checksumResponse.body().strip();
                     checksumCache.put(cacheKey, checksum);
+                    // We already know the artifact's URL and repo from this successful GET —
+                    // pre-populate resolvedCache so getResolvedFieldInternal() skips its HEAD.
+                    resolvedCache.putIfAbsent(getCacheKey(artifact),
+                            new RepositoryInformation(ResolvedUrl.of(artifactUrl), RepositoryId.of(repository.getId())));
                     return Optional.of(checksum);
                 }
 
@@ -160,6 +164,8 @@ public class RemoteChecksumCalculator extends AbstractChecksumCalculator {
                             .encode(messageDigest.digest(artifactResponse.body()))
                             .toLowerCase(Locale.ROOT);
                     checksumCache.put(cacheKey, checksum);
+                    resolvedCache.putIfAbsent(getCacheKey(artifact),
+                            new RepositoryInformation(ResolvedUrl.of(artifactUrl), RepositoryId.of(repository.getId())));
                     return Optional.of(checksum);
                 }
             }
@@ -232,7 +238,19 @@ public class RemoteChecksumCalculator extends AbstractChecksumCalculator {
     }
 
     @Override
+    public void prewarmPluginCache(Collection<Artifact> artifacts) {
+        prewarmCache(artifacts, this::calculatePluginChecksum, this::getPluginResolvedField);
+    }
+
+    @Override
     public void prewarmArtifactCache(Collection<Artifact> artifacts) {
+        prewarmCache(artifacts, this::calculateArtifactChecksum, this::getArtifactResolvedField);
+    }
+
+    private void prewarmCache(
+            Collection<Artifact> artifacts,
+            java.util.function.Consumer<Artifact> checksumFn,
+            java.util.function.Consumer<Artifact> resolvedFieldFn) {
         if (artifacts.isEmpty()) {
             return;
         }
@@ -246,8 +264,8 @@ public class RemoteChecksumCalculator extends AbstractChecksumCalculator {
             List<Future<?>> futures = new ArrayList<>();
             for (var artifact : artifacts) {
                 futures.add(executor.submit(() -> {
-                    calculateArtifactChecksum(artifact);
-                    getArtifactResolvedField(artifact);
+                    checksumFn.accept(artifact);
+                    resolvedFieldFn.accept(artifact);
                 }));
             }
             for (var future : futures) {

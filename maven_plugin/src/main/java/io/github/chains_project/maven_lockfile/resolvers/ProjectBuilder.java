@@ -34,7 +34,17 @@ public class ProjectBuilder {
     }
 
     public Optional<MavenProject> buildFromGav(String groupId, String artifactId, String version) {
-        log.debug(String.format("Resolving dependencies for%s:%s:%s", groupId, artifactId, version));
+        log.debug(String.format("Resolving dependencies for %s:%s:%s", groupId, artifactId, version));
+
+        // Check the Maven reactor first. In a multi-module build the sibling's MavenProject
+        // is already fully resolved in memory — no file I/O or network needed.
+        // session.getProjectMap() is keyed by "groupId:artifactId:version".
+        String gav = groupId + ":" + artifactId + ":" + version;
+        MavenProject reactorProject = session.getProjectMap().get(gav);
+        if (reactorProject != null) {
+            log.debug(String.format("Found %s in Maven reactor — using in-memory project", gav));
+            return Optional.of(reactorProject);
+        }
 
         var pomFileOptional = lookForPomFileInLocalRepository(groupId, artifactId, version);
 

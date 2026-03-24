@@ -98,14 +98,28 @@ public class LockFileFacade {
             MetaData metadata) {
         PluginLogManager.getLog().info(String.format("Generating lock file for project %s", project.getArtifactId()));
 
+        // Create resolvers once so their projectCache/pomChainCache/bomsCache are shared
+        // across all resolveNodeParents() calls — avoids redundant buildFromGav() invocations
+        // for artifacts that appear in multiple contexts (e.g. guava in both dep graph and plugins).
+        var artifactResolver = new NodeParentResolver(session, project.getRemoteArtifactRepositories(), checksumCalculator);
+        var pluginResolver = new NodeParentResolver(session, project.getPluginArtifactRepositories(), checksumCalculator);
+
+        // Pre-warm plugin artifact checksums/URLs in parallel before the sequential plugin loop.
+        // getPluginResolvedField + calculatePluginChecksum are otherwise called one-by-one per plugin.
+        checksumCalculator.prewarmPluginCache(project.getPluginArtifacts());
+
         Set<MavenPlugin> plugins = new TreeSet<>();
         if (metadata.getConfig().isIncludeMavenPlugins()) {
-            plugins = getAllPlugins(project, session, dependencyCollectorBuilder, checksumCalculator);
+            plugins = getAllPlugins(project, session, dependencyCollectorBuilder, checksumCalculator, pluginResolver);
         }
 
         var graph = buildDependencyGraph(session, project, dependencyCollectorBuilder, checksumCalculator,
                 metadata.getConfig().isReduced());
-        resolveNodeParents(graph, session, project.getRemoteArtifactRepositories(), checksumCalculator);
+
+        // Pre-warm: parallel buildFromGav for all dep nodes, then parallel HTTP for all parent POMs.
+        // The sequential resolve() pass then hits only in-memory caches.
+        artifactResolver.prewarm(graph.getGraph());
+        graph.getGraph().forEach(artifactResolver::resolve);
 
         return new LockFile(
                 GroupId.of(project.getGroupId()),
@@ -115,7 +129,7 @@ public class LockFileFacade {
                 graph.getRoots(),
                 plugins,
                 resolveBoms(session, project, checksumCalculator),
-                resolveExtensions(session, project, dependencyCollectorBuilder, checksumCalculator),
+                resolveExtensions(session, project, dependencyCollectorBuilder, checksumCalculator, pluginResolver),
                 metadata);
     }
 
@@ -123,7 +137,8 @@ public class LockFileFacade {
             MavenSession session,
             MavenProject project,
             DependencyCollectorBuilder dependencyCollectorBuilder,
-            AbstractChecksumCalculator checksumCalculator) {
+            AbstractChecksumCalculator checksumCalculator,
+            NodeParentResolver pluginResolver) {
         var buildExtensions = project.getBuild().getExtensions();
         PluginLogManager.getLog().info(String.format(
                 "Resolving %d build extension(s) for project %s", buildExtensions.size(), project.getArtifactId()));
@@ -143,7 +158,7 @@ public class LockFileFacade {
             String checksum = checksumCalculator.calculatePluginChecksum(artifact);
             Set<io.github.chains_project.maven_lockfile.graph.DependencyNode> deps =
                     resolvePluginDependencies(artifact, session, project, dependencyCollectorBuilder, checksumCalculator,
-                            Collections.emptyList());
+                            Collections.emptyList(), pluginResolver);
 
             Optional<MavenProject> extProjectOpt = projectBuilder.buildFromGav(
                     ext.getGroupId(), ext.getArtifactId(), ext.getVersion());
@@ -205,15 +220,9 @@ public class LockFileFacade {
 
     /**
      * Attaches a POM parent chain and BOM imports to every node in the dependency graph.
-     * Results are cached by GAV so each unique artifact is resolved at most once.
+     * Results are cached by GAV inside {@code resolver} so each unique artifact is resolved at most once.
      */
-    @SuppressWarnings("deprecation")
-    private static void resolveNodeParents(
-            DependencyGraph graph,
-            MavenSession session,
-            List<org.apache.maven.artifact.repository.ArtifactRepository> repositories,
-            AbstractChecksumCalculator checksumCalculator) {
-        var resolver = new NodeParentResolver(session, repositories, checksumCalculator);
+    private static void resolveNodeParents(DependencyGraph graph, NodeParentResolver resolver) {
         graph.getGraph().forEach(resolver::resolve);
     }
 
@@ -226,7 +235,10 @@ public class LockFileFacade {
         private final ProjectBuilder projectBuilder;
         private final BomResolver bomResolver;
         private final AbstractChecksumCalculator checksumCalculator;
-        private final Map<String, Optional<MavenProject>> projectCache = new HashMap<>();
+        // ConcurrentHashMap so the parallel prewarm() phase and sequential resolve() phase
+        // can both access it safely.
+        private final java.util.concurrent.ConcurrentHashMap<String, Optional<MavenProject>> projectCache =
+                new java.util.concurrent.ConcurrentHashMap<>();
         private final Map<String, Pom> pomChainCache = new HashMap<>();
         private final Map<String, Set<Pom>> bomsCache = new HashMap<>();
 
@@ -236,6 +248,62 @@ public class LockFileFacade {
             this.projectBuilder = new ProjectBuilder(session, repositories);
             this.bomResolver = new BomResolver(session, repositories, checksumCalculator);
             this.checksumCalculator = checksumCalculator;
+        }
+
+        /**
+         * Two-phase parallel pre-warm before the sequential resolve() traversal:
+         * <ol>
+         *   <li>Call {@code buildFromGav()} for every dep node in parallel → populates
+         *       {@code projectCache} so the sequential pass never blocks on file I/O.</li>
+         *   <li>Collect every parent POM artifact from all resolved projects, then pass
+         *       them to {@code prewarmArtifactCache()} so parent-POM HEAD and checksum
+         *       HTTP calls are issued in parallel before the sequential traversal.</li>
+         * </ol>
+         */
+        void prewarm(Collection<io.github.chains_project.maven_lockfile.graph.DependencyNode> nodes) {
+            if (nodes.isEmpty()) {
+                return;
+            }
+            int poolSize = Math.min(16, Math.max(4, Runtime.getRuntime().availableProcessors() * 2));
+            java.util.concurrent.ExecutorService executor =
+                    java.util.concurrent.Executors.newFixedThreadPool(poolSize);
+            try {
+                // Phase 1: parallel buildFromGav for all dep nodes
+                List<java.util.concurrent.Future<MavenProject>> futures = new ArrayList<>();
+                for (var node : nodes) {
+                    String gav = node.getGroupId().getValue() + ":" + node.getArtifactId().getValue()
+                            + ":" + node.getVersion().getValue();
+                    futures.add(executor.submit(() -> projectCache.computeIfAbsent(gav, k ->
+                            projectBuilder.buildFromGav(
+                                    node.getGroupId().getValue(),
+                                    node.getArtifactId().getValue(),
+                                    node.getVersion().getValue()))
+                            .orElse(null)));
+                }
+
+                // Phase 2: collect all parent POM artifacts from resolved projects
+                List<Artifact> parentPomArtifacts = new ArrayList<>();
+                for (var future : futures) {
+                    try {
+                        MavenProject project = future.get();
+                        if (project != null) {
+                            for (MavenProject p = project; p != null;
+                                    p = p.hasParent() ? p.getParent() : null) {
+                                parentPomArtifacts.add(new DefaultArtifact(
+                                        p.getGroupId(), p.getArtifactId(), p.getVersion(),
+                                        "compile", "pom", null, new DefaultArtifactHandler("pom")));
+                            }
+                        }
+                    } catch (Exception e) {
+                        PluginLogManager.getLog().debug("Prewarm buildFromGav task failed: " + e.getMessage());
+                    }
+                }
+
+                // Phase 3: parallel HTTP pre-warm for all parent POM checksums/URLs
+                checksumCalculator.prewarmArtifactCache(parentPomArtifacts);
+            } finally {
+                executor.shutdown();
+            }
         }
 
         void resolve(io.github.chains_project.maven_lockfile.graph.DependencyNode node) {
@@ -264,7 +332,8 @@ public class LockFileFacade {
             MavenProject project,
             MavenSession session,
             DependencyCollectorBuilder dependencyCollectorBuilder,
-            AbstractChecksumCalculator checksumCalculator) {
+            AbstractChecksumCalculator checksumCalculator,
+            NodeParentResolver pluginResolver) {
         Set<MavenPlugin> plugins = new TreeSet<>();
 
         Map<String, List<Dependency>> userPluginDependencies = new HashMap<>();
@@ -286,7 +355,7 @@ public class LockFileFacade {
 
             Set<io.github.chains_project.maven_lockfile.graph.DependencyNode> pluginDependencies =
                     resolvePluginDependencies(
-                            pluginArtifact, session, project, dependencyCollectorBuilder, checksumCalculator, userDeclaredDeps);
+                            pluginArtifact, session, project, dependencyCollectorBuilder, checksumCalculator, userDeclaredDeps, pluginResolver);
             Optional<MavenProject> pluginProjectOpt = pluginProjectBuilder.buildFromGav(
                     pluginArtifact.getGroupId(), pluginArtifact.getArtifactId(), pluginArtifact.getBaseVersion());
             Pom pluginPom = pluginProjectOpt.map(p -> resolveParentChain(p, checksumCalculator)).orElse(null);
@@ -323,7 +392,8 @@ public class LockFileFacade {
             MavenProject project,
             DependencyCollectorBuilder dependencyCollectorBuilder,
             AbstractChecksumCalculator checksumCalculator,
-            List<Dependency> userDeclaredDeps) {
+            List<Dependency> userDeclaredDeps,
+            NodeParentResolver pluginResolver) {
         PluginLogManager.getLog()
                 .debug(String.format("Attempting to resolve dependencies for plugin %s", pluginArtifact));
         try {
@@ -378,13 +448,13 @@ public class LockFileFacade {
                             graph.nodes().size(), pluginArtifact));
 
             DependencyGraph dependencyGraph = DependencyGraph.of(graph, checksumCalculator, false);
-            resolveNodeParents(dependencyGraph, session, project.getPluginArtifactRepositories(), checksumCalculator);
+            resolveNodeParents(dependencyGraph, pluginResolver);
 
             // Conflict-loser nodes have their subtrees pruned by Maven's resolver, but their
             // transitive POMs still need to be in the local repo for offline resolution. Resolve
             // each loser's subtree independently so hermeto can pre-fetch them.
             final Set<String> resolvingLosers = new HashSet<>();
-            dependencyGraph.populateChildrenForConflictLosers(loserNode -> {
+           /* dependencyGraph.populateChildrenForConflictLosers(loserNode -> {
                 String gav = loserNode.getGroupId().getValue() + ":"
                         + loserNode.getArtifactId().getValue() + ":"
                         + loserNode.getVersion().getValue();
@@ -401,8 +471,8 @@ public class LockFileFacade {
                         null,
                         new DefaultArtifactHandler("jar"));
                 return resolvePluginDependencies(
-                        loserArtifact, session, project, dependencyCollectorBuilder, checksumCalculator, Collections.emptyList());
-            });
+                        loserArtifact, session, project, dependencyCollectorBuilder, checksumCalculator, Collections.emptyList(), pluginResolver);
+            });*/
 
             Set<io.github.chains_project.maven_lockfile.graph.DependencyNode> roots = dependencyGraph.getRoots();
             PluginLogManager.getLog()
@@ -456,34 +526,18 @@ public class LockFileFacade {
             AbstractChecksumCalculator checksumCalculator,
             boolean reduced) {
         try {
+            // Build the reactor sibling GAV set before collection.
+            Set<String> reactorGavs = session.getProjects().stream()
+                    .map(p -> p.getGroupId() + ":" + p.getArtifactId() + ":" + p.getVersion())
+                    .collect(Collectors.toSet());
+            // Remove the current module itself — it is the graph root, not a sibling to skip.
+            reactorGavs.remove(project.getGroupId() + ":" + project.getArtifactId() + ":" + project.getVersion());
+
             ProjectBuildingRequest buildingRequest =
                     new DefaultProjectBuildingRequest(session.getProjectBuildingRequest());
             buildingRequest.setProject(project);
 
-            // Build the set of reactor (inter-module) sibling GAVs. These are built locally
-            // during the same Maven invocation and have no remote URL — Maven cannot resolve
-            // them from remote repositories, so we must exclude them from dependency collection
-            // entirely to prevent a DependencyCollectorBuilderException.
-            Set<String> reactorGavs = session.getProjects().stream()
-                    .map(p -> p.getGroupId() + ":" + p.getArtifactId() + ":" + p.getVersion())
-                    .collect(Collectors.toSet());
-            // Remove the current module itself — it is the root of the graph, not a sibling
-            reactorGavs.remove(project.getGroupId() + ":" + project.getArtifactId() + ":" + project.getVersion());
-
-            // Pass a filter to collectDependencyGraph so Maven skips reactor modules during
-            // dependency collection. Without this, Maven tries to resolve them from remote
-            // repos and fails with "Could not resolve dependencies".
-            ArtifactFilter reactorFilter = reactorGavs.isEmpty() ? null : artifact -> {
-                String gav = artifact.getGroupId() + ":" + artifact.getArtifactId() + ":" + artifact.getVersion();
-                boolean isReactor = reactorGavs.contains(gav);
-                if (isReactor) {
-                    PluginLogManager.getLog().info(String.format(
-                            "Skipping reactor (inter-module) dependency %s from lockfile", gav));
-                }
-                return !isReactor;
-            };
-
-            var rootNode = dependencyCollectorBuilder.collectDependencyGraph(buildingRequest, reactorFilter);
+            var rootNode = dependencyCollectorBuilder.collectDependencyGraph(buildingRequest, null);
 
             MutableGraph<DependencyNode> graph = GraphBuilder.directed().build();
             rootNode.accept(new GraphBuildingNodeVisitor(graph));
@@ -492,7 +546,9 @@ public class LockFileFacade {
                             "Resolved %4d dependencies for project %s",
                             graph.nodes().size(), project));
 
-            return DependencyGraph.of(graph, checksumCalculator, reduced);
+            // Reactor nodes are now in the graph but have no remote URL — exclude them from
+            // the lockfile output. Their transitive deps (all external) remain included.
+            return DependencyGraph.of(graph, checksumCalculator, reduced, reactorGavs);
         } catch (Exception e) {
             PluginLogManager.getLog().warn("Could not generate graph", e);
             return DependencyGraph.of(GraphBuilder.directed().build(), checksumCalculator, reduced);

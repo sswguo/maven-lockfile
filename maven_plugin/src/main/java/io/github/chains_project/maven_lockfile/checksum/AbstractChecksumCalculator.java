@@ -32,6 +32,10 @@ public abstract class AbstractChecksumCalculator {
         // no-op by default; override in remote implementations for parallel pre-warming
     }
 
+    public void prewarmPluginCache(Collection<Artifact> artifacts) {
+        // no-op by default; override in remote implementations for parallel pre-warming
+    }
+
     public abstract String calculateArtifactChecksum(Artifact artifact);
 
     public abstract String calculatePluginChecksum(Artifact artifact);

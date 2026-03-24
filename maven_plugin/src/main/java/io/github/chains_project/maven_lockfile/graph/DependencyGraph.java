@@ -97,7 +97,8 @@ public class DependencyGraph {
     public static DependencyGraph of(
             MutableGraph<org.apache.maven.shared.dependency.graph.DependencyNode> graph,
             AbstractChecksumCalculator calc,
-            boolean reduced) {
+            boolean reduced,
+            Set<String> reactorGavs) {
         var roots = graph.nodes().stream()
                 .filter(it -> graph.predecessors(it).isEmpty())
                 .collect(Collectors.toList());
@@ -112,7 +113,7 @@ public class DependencyGraph {
 
         Set<DependencyNode> nodes = new TreeSet<>(Comparator.comparing(DependencyNode::getComparatorString));
         for (var artifact : roots) {
-            createDependencyNode(artifact, graph, calc, true, reduced).ifPresent(nodes::add);
+            createDependencyNodes(artifact, graph, calc, true, reduced, reactorGavs).forEach(nodes::add);
         }
         // maven dependency tree contains the project itself as a root node. We remove it here.
         Set<DependencyNode> dependencyRoots = nodes.stream()
@@ -123,19 +124,58 @@ public class DependencyGraph {
         return new DependencyGraph(dependencyRoots);
     }
 
-    private static Optional<DependencyNode> createDependencyNode(
+    public static DependencyGraph of(
+            MutableGraph<org.apache.maven.shared.dependency.graph.DependencyNode> graph,
+            AbstractChecksumCalculator calc,
+            boolean reduced) {
+        return of(graph, calc, reduced, Set.of());
+    }
+
+    /**
+     * Creates dependency node(s) for a given graph node.
+     *
+     * <p>Returns a list instead of a single optional so that reactor siblings can be
+     * "transparent": the sibling artifact itself is skipped (it has no remote URL), but
+     * its transitive dependencies are promoted and returned as if they were direct
+     * dependencies of the caller. This ensures that transitive deps of reactor siblings
+     * (which still need to be downloaded from remote repositories) are recorded in the
+     * lockfile and available during offline builds.
+     */
+    private static List<DependencyNode> createDependencyNodes(
             org.apache.maven.shared.dependency.graph.DependencyNode node,
             Graph<org.apache.maven.shared.dependency.graph.DependencyNode> graph,
             AbstractChecksumCalculator calc,
             boolean isRoot,
-            boolean reduce) {
+            boolean reduce,
+            Set<String> reactorGavs) {
         PluginLogManager.getLog()
                 .debug(String.format("Creating dependency node for: %s, root: %s", node.toNodeString(), isRoot));
+
+        // Reactor (inter-module) siblings are local build artifacts — skip the artifact itself
+        // from the lockfile since it has no remote URL to record. However, its transitive
+        // dependencies DO need to be downloaded, so we promote them up to the caller.
+        if (!isRoot && !reactorGavs.isEmpty()) {
+            String gav = node.getArtifact().getGroupId() + ":"
+                    + node.getArtifact().getArtifactId() + ":"
+                    + node.getArtifact().getVersion();
+            if (reactorGavs.contains(gav)) {
+                PluginLogManager.getLog().info(String.format(
+                        "Skipping reactor (inter-module) dependency %s from lockfile,"
+                                + " promoting its transitive dependencies",
+                        gav));
+                return graph.successors(node).stream()
+                        .flatMap(child ->
+                                createDependencyNodes(child, graph, calc, false, reduce, reactorGavs).stream())
+                        .collect(Collectors.toList());
+            }
+        }
+
         var groupId = GroupId.of(node.getArtifact().getGroupId());
         var artifactId = ArtifactId.of(node.getArtifact().getArtifactId());
         var version = VersionNumber.of(node.getArtifact().getVersion());
         var classifier = Classifier.of(node.getArtifact().getClassifier());
         var type = ArtifactType.of(node.getArtifact().getType());
+
         PluginLogManager.getLog().debug(String.format("Calculating checksum for %s", node.toNodeString()));
         var checksum = isRoot ? "" : calc.calculateArtifactChecksum(node.getArtifact());
         var scope = MavenScope.fromString(node.getArtifact().getScope());
@@ -147,7 +187,7 @@ public class DependencyGraph {
         // if there is no conflict marker for this node, we use the version from the artifact
         String baseVersion = included ? node.getArtifact().getVersion() : winnerVersion.get();
         if (reduce && !included) {
-            return Optional.empty();
+            return List.of();
         }
         DependencyNode value = new DependencyNode(
                 artifactId,
@@ -163,8 +203,8 @@ public class DependencyGraph {
         value.setSelectedVersion(baseVersion);
         value.setIncluded(included);
         for (var artifact : graph.successors(node)) {
-            createDependencyNode(artifact, graph, calc, false, reduce).ifPresent(value::addChild);
+            createDependencyNodes(artifact, graph, calc, false, reduce, reactorGavs).forEach(value::addChild);
         }
-        return Optional.of(value);
+        return List.of(value);
     }
 }
