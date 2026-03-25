@@ -151,22 +151,18 @@ public class DependencyGraph {
         PluginLogManager.getLog()
                 .debug(String.format("Creating dependency node for: %s, root: %s", node.toNodeString(), isRoot));
 
-        // Reactor (inter-module) siblings are local build artifacts — skip the artifact itself
-        // from the lockfile since it has no remote URL to record. However, its transitive
-        // dependencies DO need to be downloaded, so we promote them up to the caller.
+        // Reactor (inter-module) siblings are local build artifacts — skip them entirely.
+        // Their transitive dependencies are already captured in their own module's lockfile,
+        // and since all modules are always built together in reactor order, there is no need
+        // to promote those deps into the depending module's lockfile.
         if (!isRoot && !reactorGavs.isEmpty()) {
             String gav = node.getArtifact().getGroupId() + ":"
                     + node.getArtifact().getArtifactId() + ":"
                     + node.getArtifact().getVersion();
             if (reactorGavs.contains(gav)) {
                 PluginLogManager.getLog().info(String.format(
-                        "Skipping reactor (inter-module) dependency %s from lockfile,"
-                                + " promoting its transitive dependencies",
-                        gav));
-                return graph.successors(node).stream()
-                        .flatMap(child ->
-                                createDependencyNodes(child, graph, calc, false, reduce, reactorGavs).stream())
-                        .collect(Collectors.toList());
+                        "Skipping reactor (inter-module) dependency %s from lockfile", gav));
+                return List.of();
             }
         }
 
