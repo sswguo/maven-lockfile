@@ -66,12 +66,14 @@ public class BomResolver {
             if (dependencyManagement != null && !dependencyManagement.getDependencies().isEmpty()) {
                 for (Dependency dependency : dependencyManagement.getDependencies()) {
                     if ("pom".equals(dependency.getType()) && "import".equals(dependency.getScope())) {
-                        var resolvedVersion = resolveVersionFromPlaceholder(dependency.getVersion(), current);
-                        String cacheKey = dependency.getGroupId() + ":" + dependency.getArtifactId() + ":" + resolvedVersion;
+                        var resolvedGroupId = resolvePropertyPlaceholder(dependency.getGroupId(), current);
+                        var resolvedArtifactId = resolvePropertyPlaceholder(dependency.getArtifactId(), current);
+                        var resolvedVersion = resolvePropertyPlaceholder(dependency.getVersion(), current);
+                        String cacheKey = resolvedGroupId + ":" + resolvedArtifactId + ":" + resolvedVersion;
                         var bomProjectOptional = projectCache.computeIfAbsent(cacheKey, k -> {
-                            PluginLogManager.getLog().warn(String.format("Resolving BOM for %s (from parent chain of %s)", dependency, project.getArtifactId()));
+                            PluginLogManager.getLog().info(String.format("Resolving BOM for %s:%s:%s (from parent chain of %s)", resolvedGroupId, resolvedArtifactId, resolvedVersion, project.getArtifactId()));
                             return projectBuilder.buildFromGav(
-                                    dependency.getGroupId(), dependency.getArtifactId(), resolvedVersion);
+                                    resolvedGroupId, resolvedArtifactId, resolvedVersion);
                         });
 
                         if (bomProjectOptional.isEmpty()) {
@@ -98,9 +100,9 @@ public class BomResolver {
         return boms;
     }
 
-    private String resolveVersionFromPlaceholder(String version, MavenProject project) {
-        if (version != null && version.startsWith("${") && version.endsWith("}")) {
-            String propertyName = version.substring(2, version.length() - 1);
+    private String resolvePropertyPlaceholder(String value, MavenProject project) {
+        if (value != null && value.startsWith("${") && value.endsWith("}")) {
+            String propertyName = value.substring(2, value.length() - 1);
 
             // Handle Maven built-in project expressions first
             switch (propertyName) {
@@ -114,19 +116,21 @@ public class BomResolver {
                 case "pom.artifactId":
                     return project.getArtifactId();
                 case "project.parent.version":
-                    return project.hasParent() ? project.getParent().getVersion() : version;
+                    return project.hasParent() ? project.getParent().getVersion() : value;
                 default:
                     break;
             }
 
-            // Fall back to user-defined properties
-            var resolvedVersion = project.getModel().getProperties().getProperty(propertyName);
-            if (resolvedVersion != null) {
-                return resolvedVersion;
+            // Walk the project and its parent chain to find the property
+            for (MavenProject p = project; p != null; p = p.hasParent() ? p.getParent() : null) {
+                String resolved = p.getModel().getProperties().getProperty(propertyName);
+                if (resolved != null) {
+                    return resolved;
+                }
             }
         }
 
-        return version;
+        return value;
     }
 
     /**

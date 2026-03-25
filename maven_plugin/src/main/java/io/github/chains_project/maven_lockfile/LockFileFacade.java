@@ -21,6 +21,7 @@ import io.github.chains_project.maven_lockfile.data.P2Repository;
 import io.github.chains_project.maven_lockfile.resolvers.BomResolver;
 import io.github.chains_project.maven_lockfile.resolvers.P2Resolver;
 import io.github.chains_project.maven_lockfile.resolvers.ProjectBuilder;
+import io.github.chains_project.maven_lockfile.resolvers.QuarkusDeploymentResolver;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -354,26 +355,82 @@ public class LockFileFacade {
             NodeParentResolver pluginResolver) {
         Set<MavenPlugin> plugins = new TreeSet<>();
 
-        Map<String, List<Dependency>> userPluginDependencies = new HashMap<>();
+        // originalUserPluginDeps: only what the project's pom.xml declares for each plugin.
+        // allUserPluginDeps: pom.xml deps + QuarkusDeploymentResolver-injected deployment deps.
+        // Keeping them separate lets us do a two-phase resolution for quarkus-maven-plugin:
+        //   Phase 1 (original only) → captures plugin's native dep versions (e.g. 3.27.0)
+        //   Phase 2 (all)           → captures deployment artifact chain (e.g. 3.27.2)
+        // The union of both phases ensures hermeto downloads all required versions.
+        Map<String, List<Dependency>> originalUserPluginDeps = new HashMap<>();
+        Map<String, List<Dependency>> allUserPluginDeps = new HashMap<>();
         if (project.getBuild() != null && project.getBuild().getPlugins() != null) {
             for (Plugin plugin : project.getBuild().getPlugins()) {
                 String key = plugin.getGroupId() + ":" + plugin.getArtifactId();
                 if (plugin.getDependencies() != null && !plugin.getDependencies().isEmpty()) {
-                    userPluginDependencies.put(key, plugin.getDependencies());
+                    originalUserPluginDeps.put(key, new ArrayList<>(plugin.getDependencies()));
+                    allUserPluginDeps.put(key, new ArrayList<>(plugin.getDependencies()));
                 }
             }
         }
 
+        // Auto-discover Quarkus deployment artifacts that quarkus-maven-plugin:generate-code
+        // loads dynamically via the Quarkus bootstrap mechanism. Inject them only into
+        // allUserPluginDeps so the original version is preserved for the two-phase resolution.
+        String quarkusPluginKey = null;
+        if (QuarkusDeploymentResolver.isQuarkusProject(project)) {
+            PluginLogManager.getLog().info("Quarkus project detected — auto-discovering deployment artifacts");
+            List<Dependency> discoveredDeps = QuarkusDeploymentResolver.discoverDeploymentDependencies(project, session);
+            if (!discoveredDeps.isEmpty()) {
+                quarkusPluginKey = project.getBuildPlugins().stream()
+                        .filter(p -> "quarkus-maven-plugin".equals(p.getArtifactId()))
+                        .map(p -> p.getGroupId() + ":" + p.getArtifactId())
+                        .findFirst()
+                        .orElse("io.quarkus:quarkus-maven-plugin");
+                List<Dependency> allDeps = allUserPluginDeps.computeIfAbsent(
+                        quarkusPluginKey, k -> new ArrayList<>());
+                java.util.Set<String> existingGas = new java.util.HashSet<>();
+                for (Dependency d : allDeps) {
+                    existingGas.add(d.getGroupId() + ":" + d.getArtifactId());
+                }
+                for (Dependency discovered : discoveredDeps) {
+                    String ga = discovered.getGroupId() + ":" + discovered.getArtifactId();
+                    if (existingGas.add(ga)) {
+                        allDeps.add(discovered);
+                        PluginLogManager.getLog().debug("Quarkus: injecting deployment dep " + ga);
+                    }
+                }
+            }
+        }
+
+        final String finalQuarkusPluginKey = quarkusPluginKey;
         ProjectBuilder pluginProjectBuilder = new ProjectBuilder(session, project.getPluginArtifactRepositories());
         BomResolver pluginBomResolver = new BomResolver(session, project.getPluginArtifactRepositories(), checksumCalculator);
         for (Artifact pluginArtifact : project.getPluginArtifacts()) {
             RepositoryInformation repositoryInformation = checksumCalculator.getPluginResolvedField(pluginArtifact);
             String pluginKey = pluginArtifact.getGroupId() + ":" + pluginArtifact.getArtifactId();
-            List<Dependency> userDeclaredDeps = userPluginDependencies.getOrDefault(pluginKey, Collections.emptyList());
+            List<Dependency> originalDeps = originalUserPluginDeps.getOrDefault(pluginKey, Collections.emptyList());
+            List<Dependency> allDeps = allUserPluginDeps.getOrDefault(pluginKey, Collections.emptyList());
 
-            Set<io.github.chains_project.maven_lockfile.graph.DependencyNode> pluginDependencies =
-                    resolvePluginDependencies(
-                            pluginArtifact, session, project, dependencyCollectorBuilder, checksumCalculator, userDeclaredDeps, pluginResolver);
+            Set<io.github.chains_project.maven_lockfile.graph.DependencyNode> pluginDependencies;
+            if (pluginKey.equals(finalQuarkusPluginKey) && !originalDeps.equals(allDeps)) {
+                // Two-phase resolution: union plugin's native deps (original versions) with the
+                // extended deployment-artifact chain (platform BOM versions). This prevents Maven's
+                // version conflict resolution from dropping the plugin's own pinned versions (e.g.
+                // quarkus-bootstrap-maven-resolver:3.27.0) when deployment artifacts bring in newer
+                // versions of the same artifacts (e.g. 3.27.2 from the platform BOM).
+                Set<io.github.chains_project.maven_lockfile.graph.DependencyNode> nativeDeps =
+                        resolvePluginDependencies(pluginArtifact, session, project,
+                                dependencyCollectorBuilder, checksumCalculator, originalDeps, pluginResolver);
+                Set<io.github.chains_project.maven_lockfile.graph.DependencyNode> extendedDeps =
+                        resolvePluginDependencies(pluginArtifact, session, project,
+                                dependencyCollectorBuilder, checksumCalculator, allDeps, pluginResolver);
+                pluginDependencies = new HashSet<>(nativeDeps);
+                pluginDependencies.addAll(extendedDeps);
+            } else {
+                pluginDependencies = resolvePluginDependencies(
+                        pluginArtifact, session, project, dependencyCollectorBuilder,
+                        checksumCalculator, allDeps, pluginResolver);
+            }
             Optional<MavenProject> pluginProjectOpt = pluginProjectBuilder.buildFromGav(
                     pluginArtifact.getGroupId(), pluginArtifact.getArtifactId(), pluginArtifact.getBaseVersion());
             Pom pluginPom = pluginProjectOpt.map(p -> resolveParentChain(p, checksumCalculator)).orElse(null);
