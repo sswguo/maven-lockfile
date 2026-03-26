@@ -2,6 +2,9 @@ package io.github.chains_project.maven_lockfile;
 
 import com.google.common.base.Strings;
 import io.github.chains_project.maven_lockfile.checksum.AbstractChecksumCalculator;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import io.github.chains_project.maven_lockfile.checksum.ChecksumModes;
 import io.github.chains_project.maven_lockfile.checksum.FileSystemChecksumCalculator;
 import io.github.chains_project.maven_lockfile.checksum.RemoteChecksumCalculator;
@@ -77,6 +80,46 @@ public abstract class AbstractLockfileMojo extends AbstractMojo {
 
     @Parameter(defaultValue = "${mojoExecution}", readonly = true)
     protected MojoExecution mojo;
+
+    /**
+     * Platform-specific binary artifacts to resolve for all known OS/architecture classifiers.
+     * Each entry must be in the format {@code groupId:artifactId:type:version}.
+     *
+     * <p>Example:
+     * <pre>{@code
+     * <platformArtifacts>
+     *   <platformArtifact>com.google.protobuf:protoc:exe:3.25.5</platformArtifact>
+     *   <platformArtifact>io.grpc:protoc-gen-grpc-java:exe:1.68.0</platformArtifact>
+     * </platformArtifacts>
+     * }</pre>
+     */
+    /**
+     * Comma-separated platform artifact specs for command-line use:
+     * {@code -DplatformArtifacts=com.google.protobuf:protoc:exe:3.25.5,io.grpc:protoc-gen-grpc-java:exe:1.68.0}
+     */
+    @Parameter(property = "platformArtifacts")
+    protected String platformArtifactsProperty;
+
+    /**
+     * Platform-specific binary artifacts to resolve for all known OS/architecture classifiers.
+     * Each entry must be in the format {@code groupId:artifactId:type:version}.
+     *
+     * <pre>{@code
+     * <platformArtifacts>
+     *   <platformArtifact>com.google.protobuf:protoc:exe:3.25.5</platformArtifact>
+     *   <platformArtifact>io.grpc:protoc-gen-grpc-java:exe:1.68.0</platformArtifact>
+     * </platformArtifacts>
+     * }</pre>
+     */
+    @Parameter
+    protected List<String> platformArtifacts = new ArrayList<>();
+
+    protected List<String> getEffectivePlatformArtifacts() {
+        if (platformArtifactsProperty != null && !platformArtifactsProperty.isBlank()) {
+            return Arrays.asList(platformArtifactsProperty.split(","));
+        }
+        return platformArtifacts;
+    }
 
     protected Environment generateMetaInformation() {
         String osName = System.getProperty("os.name");

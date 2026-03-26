@@ -47,7 +47,7 @@ import org.w3c.dom.NodeList;
  * closure of every deployment artifact is resolved and written to the lockfile — without any
  * manual changes to the project's {@code pom.xml}.
  */
-public class QuarkusDeploymentResolver {
+public class QuarkusDeploymentResolver extends SpecialPluginResolver {
 
     private static final String QUARKUS_PLUGIN_ARTIFACT_ID = "quarkus-maven-plugin";
     private static final String QUARKUS_EXTENSION_PROPERTIES = "META-INF/quarkus-extension.properties";
@@ -56,11 +56,38 @@ public class QuarkusDeploymentResolver {
     private static final String PLATFORM_PROPERTIES_ARTIFACT = "quarkus-bom-quarkus-platform-properties";
     private static final String DEPLOYMENT_SUFFIX = "-deployment";
 
-    private QuarkusDeploymentResolver() {}
+    public QuarkusDeploymentResolver() {}
+
+    @Override
+    public boolean isApplicable(MavenProject project) {
+        return project.getBuildPlugins().stream()
+                .anyMatch(p -> QUARKUS_PLUGIN_ARTIFACT_ID.equals(p.getArtifactId()));
+    }
+
+    @Override
+    public String getDisplayName() {
+        return "Quarkus";
+    }
+
+    @Override
+    public DiscoveryResult discover(MavenProject project, MavenSession session) {
+        List<Dependency> deps = discoverDeploymentDependencies(project, session);
+        if (deps.isEmpty()) {
+            return DiscoveryResult.empty();
+        }
+        String pluginKey = project.getBuildPlugins().stream()
+                .filter(p -> QUARKUS_PLUGIN_ARTIFACT_ID.equals(p.getArtifactId()))
+                .map(p -> p.getGroupId() + ":" + p.getArtifactId())
+                .findFirst()
+                .orElse("io.quarkus:" + QUARKUS_PLUGIN_ARTIFACT_ID);
+        return DiscoveryResult.ofPluginDependencies(pluginKey, deps);
+    }
 
     /**
      * Returns {@code true} if the project uses {@code quarkus-maven-plugin}.
+     * @deprecated use {@link #isApplicable(MavenProject)} instead.
      */
+    @Deprecated
     public static boolean isQuarkusProject(MavenProject project) {
         return project.getBuildPlugins().stream()
                 .anyMatch(p -> QUARKUS_PLUGIN_ARTIFACT_ID.equals(p.getArtifactId()));

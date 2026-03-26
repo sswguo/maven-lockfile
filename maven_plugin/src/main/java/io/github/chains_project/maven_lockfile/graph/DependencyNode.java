@@ -44,6 +44,28 @@ public class DependencyNode implements Comparable<DependencyNode> {
 
     private Pom pom;
 
+    /**
+     * Creates a flat (no-children) dependency node for a platform-specific binary artifact
+     * (e.g. {@code protoc:exe:linux-x86_64}). Scope is set to {@code compile} since these
+     * artifacts are required at build time.
+     */
+    public static DependencyNode ofPlatformArtifact(
+            ArtifactId artifactId,
+            GroupId groupId,
+            VersionNumber version,
+            Classifier classifier,
+            ArtifactType type,
+            ResolvedUrl resolved,
+            RepositoryId repositoryId,
+            String checksumAlgorithm,
+            String checksum) {
+        DependencyNode node = new DependencyNode(
+                artifactId, groupId, version, classifier, type,
+                MavenScope.COMPILE, resolved, repositoryId, checksumAlgorithm, checksum);
+        node.setIncluded(true);
+        return node;
+    }
+
     DependencyNode(
             ArtifactId artifactId,
             GroupId groupId,

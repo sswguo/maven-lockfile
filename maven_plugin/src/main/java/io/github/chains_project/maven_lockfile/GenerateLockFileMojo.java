@@ -59,7 +59,8 @@ public class GenerateLockFileMojo extends AbstractLockfileMojo {
             }
             AbstractChecksumCalculator checksumCalculator = getChecksumCalculator(config);
             LockFile lockFile = LockFileFacade.generateLockFileFromProject(
-                    session, project, dependencyCollectorBuilder, checksumCalculator, metaData);
+                    session, project, dependencyCollectorBuilder, checksumCalculator, metaData,
+                    getEffectivePlatformArtifacts());
 
             Path lockFilePath = LockFileFacade.getLockFilePath(project, lockfileName);
             Files.writeString(lockFilePath, JsonUtils.toJson(lockFile));

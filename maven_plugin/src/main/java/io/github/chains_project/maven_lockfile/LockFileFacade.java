@@ -20,11 +20,17 @@ import io.github.chains_project.maven_lockfile.data.P2DependencyNode;
 import io.github.chains_project.maven_lockfile.data.P2Repository;
 import io.github.chains_project.maven_lockfile.resolvers.BomResolver;
 import io.github.chains_project.maven_lockfile.resolvers.P2Resolver;
+import io.github.chains_project.maven_lockfile.resolvers.PlatformArtifactResolver;
 import io.github.chains_project.maven_lockfile.resolvers.ProjectBuilder;
+import io.github.chains_project.maven_lockfile.resolvers.ProtobufMavenPluginResolver;
 import io.github.chains_project.maven_lockfile.resolvers.QuarkusDeploymentResolver;
+import io.github.chains_project.maven_lockfile.resolvers.MavenCompilerPluginResolver;
+import io.github.chains_project.maven_lockfile.resolvers.SpecialPluginResolver;
+import io.github.chains_project.maven_lockfile.resolvers.SurefirePluginResolver;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.stream.Collectors;
+import java.util.List;
 import org.apache.maven.artifact.Artifact;
 import org.apache.maven.artifact.DefaultArtifact;
 import org.apache.maven.artifact.handler.DefaultArtifactHandler;
@@ -46,6 +52,16 @@ import org.apache.maven.shared.dependency.graph.traversal.DependencyNodeVisitor;
  *
  */
 public class LockFileFacade {
+
+    /**
+     * Registry of all special plugin resolvers. Add new implementations here to extend
+     * lockfile generation to new build plugins without touching any other code.
+     */
+    private static final List<SpecialPluginResolver> PLUGIN_RESOLVERS = List.of(
+            new QuarkusDeploymentResolver(),
+            new ProtobufMavenPluginResolver(),
+            new SurefirePluginResolver(),
+            new MavenCompilerPluginResolver());
 
     /**
      * This visitor is used to traverse the dependency graph and add the edges to the graph.
@@ -100,6 +116,18 @@ public class LockFileFacade {
             DependencyCollectorBuilder dependencyCollectorBuilder,
             AbstractChecksumCalculator checksumCalculator,
             MetaData metadata) {
+        return generateLockFileFromProject(
+                session, project, dependencyCollectorBuilder, checksumCalculator, metadata,
+                Collections.emptyList());
+    }
+
+    public static LockFile generateLockFileFromProject(
+            MavenSession session,
+            MavenProject project,
+            DependencyCollectorBuilder dependencyCollectorBuilder,
+            AbstractChecksumCalculator checksumCalculator,
+            MetaData metadata,
+            List<String> platformArtifactSpecs) {
         PluginLogManager.getLog().info(String.format("Generating lock file for project %s", project.getArtifactId()));
 
         // Create resolvers once so their projectCache/pomChainCache/bomsCache are shared
@@ -125,6 +153,36 @@ public class LockFileFacade {
         artifactResolver.prewarm(graph.getGraph());
         graph.getGraph().forEach(artifactResolver::resolve);
 
+        // Resolve platform-specific binary artifacts (e.g. protoc) for the current platform.
+        Set<io.github.chains_project.maven_lockfile.graph.DependencyNode> allRoots =
+                new TreeSet<>(Comparator.comparing(
+                        io.github.chains_project.maven_lockfile.graph.DependencyNode::getComparatorString));
+        allRoots.addAll(graph.getRoots());
+
+        // Collect platform artifact specs from all resolvers + manually declared platformArtifacts.
+        List<String> allPlatformSpecs = new ArrayList<>(platformArtifactSpecs);
+        for (SpecialPluginResolver resolver : PLUGIN_RESOLVERS) {
+            if (!resolver.isApplicable(project)) continue;
+            SpecialPluginResolver.DiscoveryResult result = resolver.discover(project, session);
+            allPlatformSpecs.addAll(result.getPlatformArtifactSpecs());
+        }
+
+        if (!allPlatformSpecs.isEmpty()) {
+            String osClassifier = PlatformArtifactResolver.detectOsClassifier(project);
+            if (osClassifier == null) {
+                PluginLogManager.getLog().warn(
+                        "PlatformArtifacts: platform artifacts found but os-maven-plugin not present"
+                                + " or os.detected.classifier not set — skipping platform artifact resolution");
+            } else {
+                List<io.github.chains_project.maven_lockfile.graph.DependencyNode> platformNodes =
+                        PlatformArtifactResolver.resolve(allPlatformSpecs, osClassifier, checksumCalculator);
+                allRoots.addAll(platformNodes);
+                PluginLogManager.getLog().info(String.format(
+                        "PlatformArtifacts: added %d platform binary node(s) for %s",
+                        platformNodes.size(), osClassifier));
+            }
+        }
+
         // Resolve P2/OSGi dependencies for Tycho projects
         List<P2DependencyNode> p2Dependencies = Collections.emptyList();
         List<P2Repository> p2Repositories = Collections.emptyList();
@@ -143,7 +201,7 @@ public class LockFileFacade {
                 ArtifactId.of(project.getArtifactId()),
                 VersionNumber.of(project.getVersion()),
                 constructProjectPomChain(project, checksumCalculator),
-                graph.getRoots(),
+                allRoots,
                 plugins,
                 resolveBoms(session, project, checksumCalculator),
                 resolveExtensions(session, project, dependencyCollectorBuilder, checksumCalculator, pluginResolver),
@@ -373,36 +431,37 @@ public class LockFileFacade {
             }
         }
 
-        // Auto-discover Quarkus deployment artifacts that quarkus-maven-plugin:generate-code
-        // loads dynamically via the Quarkus bootstrap mechanism. Inject them only into
-        // allUserPluginDeps so the original version is preserved for the two-phase resolution.
-        String quarkusPluginKey = null;
-        if (QuarkusDeploymentResolver.isQuarkusProject(project)) {
-            PluginLogManager.getLog().info("Quarkus project detected — auto-discovering deployment artifacts");
-            List<Dependency> discoveredDeps = QuarkusDeploymentResolver.discoverDeploymentDependencies(project, session);
-            if (!discoveredDeps.isEmpty()) {
-                quarkusPluginKey = project.getBuildPlugins().stream()
-                        .filter(p -> "quarkus-maven-plugin".equals(p.getArtifactId()))
-                        .map(p -> p.getGroupId() + ":" + p.getArtifactId())
-                        .findFirst()
-                        .orElse("io.quarkus:quarkus-maven-plugin");
-                List<Dependency> allDeps = allUserPluginDeps.computeIfAbsent(
-                        quarkusPluginKey, k -> new ArrayList<>());
-                java.util.Set<String> existingGas = new java.util.HashSet<>();
-                for (Dependency d : allDeps) {
-                    existingGas.add(d.getGroupId() + ":" + d.getArtifactId());
-                }
-                for (Dependency discovered : discoveredDeps) {
-                    String ga = discovered.getGroupId() + ":" + discovered.getArtifactId();
+        // Run all registered special plugin resolvers. Resolvers that produce plugin dependencies
+        // inject them into allUserPluginDeps for the target plugin. Track which plugin keys had
+        // deps injected so we can apply two-phase resolution for those plugins later.
+        Set<String> twoPhasePluginKeys = new HashSet<>();
+        for (SpecialPluginResolver resolver : PLUGIN_RESOLVERS) {
+            if (!resolver.isApplicable(project)) continue;
+            PluginLogManager.getLog().info(
+                    resolver.getDisplayName() + " detected — running special plugin resolver");
+            SpecialPluginResolver.DiscoveryResult result = resolver.discover(project, session);
+            if (result.isEmpty()) continue;
+
+            for (Map.Entry<String, List<Dependency>> entry :
+                    result.getPluginDependencies().entrySet()) {
+                String pluginKey = entry.getKey();
+                List<Dependency> discovered = entry.getValue();
+                List<Dependency> allDeps =
+                        allUserPluginDeps.computeIfAbsent(pluginKey, k -> new ArrayList<>());
+                Set<String> existingGas = new HashSet<>();
+                for (Dependency d : allDeps) existingGas.add(d.getGroupId() + ":" + d.getArtifactId());
+                for (Dependency dep : discovered) {
+                    String ga = dep.getGroupId() + ":" + dep.getArtifactId();
                     if (existingGas.add(ga)) {
-                        allDeps.add(discovered);
-                        PluginLogManager.getLog().debug("Quarkus: injecting deployment dep " + ga);
+                        allDeps.add(dep);
+                        PluginLogManager.getLog().debug(
+                                resolver.getDisplayName() + ": injecting dep " + ga
+                                        + " into " + pluginKey);
                     }
                 }
+                twoPhasePluginKeys.add(pluginKey);
             }
         }
-
-        final String finalQuarkusPluginKey = quarkusPluginKey;
         ProjectBuilder pluginProjectBuilder = new ProjectBuilder(session, project.getPluginArtifactRepositories());
         BomResolver pluginBomResolver = new BomResolver(session, project.getPluginArtifactRepositories(), checksumCalculator);
         for (Artifact pluginArtifact : project.getPluginArtifacts()) {
@@ -412,12 +471,11 @@ public class LockFileFacade {
             List<Dependency> allDeps = allUserPluginDeps.getOrDefault(pluginKey, Collections.emptyList());
 
             Set<io.github.chains_project.maven_lockfile.graph.DependencyNode> pluginDependencies;
-            if (pluginKey.equals(finalQuarkusPluginKey) && !originalDeps.equals(allDeps)) {
+            if (twoPhasePluginKeys.contains(pluginKey) && !originalDeps.equals(allDeps)) {
                 // Two-phase resolution: union plugin's native deps (original versions) with the
-                // extended deployment-artifact chain (platform BOM versions). This prevents Maven's
-                // version conflict resolution from dropping the plugin's own pinned versions (e.g.
-                // quarkus-bootstrap-maven-resolver:3.27.0) when deployment artifacts bring in newer
-                // versions of the same artifacts (e.g. 3.27.2 from the platform BOM).
+                // extended discovered deps. This prevents Maven's version conflict resolution from
+                // dropping the plugin's own pinned versions when discovered artifacts bring in
+                // newer versions of the same artifact.
                 Set<io.github.chains_project.maven_lockfile.graph.DependencyNode> nativeDeps =
                         resolvePluginDependencies(pluginArtifact, session, project,
                                 dependencyCollectorBuilder, checksumCalculator, originalDeps, pluginResolver);
