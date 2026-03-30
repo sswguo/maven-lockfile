@@ -233,6 +233,13 @@ public class LockFileFacade {
         List<io.github.chains_project.maven_lockfile.graph.DependencyNode> extraDependencies =
                 ExtraArtifactResolver.extractExtras(extraTracker, alreadyRecordedGavs, checksumCalculator);
 
+        // Write tracker output file so all captured artifacts are visible for diagnostics
+        // and can be inspected independently of the lockfile.
+        java.io.File trackerOutputFile = new java.io.File(
+                session.getRequest().getMultiModuleProjectDirectory(),
+                ".mvn/tracker-artifacts.json");
+        extraTracker.writeToFile(trackerOutputFile);
+
         return new LockFile(
                 GroupId.of(project.getGroupId()),
                 ArtifactId.of(project.getArtifactId()),

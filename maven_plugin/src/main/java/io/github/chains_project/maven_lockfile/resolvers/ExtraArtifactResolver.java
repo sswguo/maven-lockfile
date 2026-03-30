@@ -13,6 +13,7 @@ import io.github.chains_project.maven_lockfile.reporting.PluginLogManager;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -227,6 +228,55 @@ public class ExtraArtifactResolver {
          */
         public DefaultRepositorySystemSession getMutableSession() {
             return mutableSession;
+        }
+
+        /**
+         * Writes all captured artifacts to a JSON file.
+         * Format: JSON array with {@code url}, {@code groupId}, {@code artifactId},
+         * {@code version}, {@code classifier}, {@code extension} per entry.
+         */
+        public void writeToFile(File outputFile) {
+            outputFile.getParentFile().mkdirs();
+            StringBuilder sb = new StringBuilder("[\n");
+            boolean first = true;
+            for (CapturedArtifact captured : capturedArtifacts.values()) {
+                if (!first) sb.append(",\n");
+                first = false;
+                Artifact artifact = captured.artifact;
+                String base = captured.sourceRepo.getUrl().endsWith("/")
+                        ? captured.sourceRepo.getUrl() : captured.sourceRepo.getUrl() + "/";
+                String urlPath = "";
+                if (captured.file != null) {
+                    String absPath = captured.file.getAbsolutePath();
+                    String localBase = localRepoBase.endsWith(File.separator)
+                            ? localRepoBase : localRepoBase + File.separator;
+                    if (absPath.startsWith(localBase)) {
+                        urlPath = absPath.substring(localBase.length())
+                                .replace(File.separatorChar, '/');
+                    }
+                }
+                sb.append("  {\n");
+                sb.append("    \"url\": \"").append(esc(base + urlPath)).append("\",\n");
+                sb.append("    \"groupId\": \"").append(esc(artifact.getGroupId())).append("\",\n");
+                sb.append("    \"artifactId\": \"").append(esc(artifact.getArtifactId())).append("\",\n");
+                sb.append("    \"version\": \"").append(esc(artifact.getVersion())).append("\",\n");
+                sb.append("    \"classifier\": \"").append(esc(artifact.getClassifier())).append("\",\n");
+                sb.append("    \"extension\": \"").append(esc(artifact.getExtension())).append("\"\n");
+                sb.append("  }");
+            }
+            sb.append("\n]");
+            try {
+                Files.writeString(outputFile.toPath(), sb.toString());
+                PluginLogManager.getLog().info(String.format(
+                        "Tracker: wrote %d artifact(s) to %s", capturedArtifacts.size(), outputFile));
+            } catch (IOException e) {
+                PluginLogManager.getLog().warn(
+                        "Tracker: could not write tracker file " + outputFile + ": " + e.getMessage());
+            }
+        }
+
+        private static String esc(String s) {
+            return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"");
         }
     }
 
