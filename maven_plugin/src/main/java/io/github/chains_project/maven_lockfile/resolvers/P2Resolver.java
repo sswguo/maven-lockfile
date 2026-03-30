@@ -166,37 +166,65 @@ public class P2Resolver {
     // P2 repository resolution
     // -------------------------------------------------------------------------
 
+    private static final int MAX_COMPOSITE_DEPTH = 5;
+
     /**
-     * Downloads and parses the P2 repository metadata (content.jar + artifacts.jar),
-     * resolves the transitive closure of the required IUs, and returns the artifact list
-     * plus the repository metadata entry for hermeto to download.
+     * Entry point for resolving a P2 repository — handles both simple repos
+     * (content.jar) and composite repos (compositeContent.jar) transparently.
      */
     private static P2ResolverResult resolveFromRepository(
             String repoUrl, Set<String> requiredIuIds) throws Exception {
+        return resolveFromRepository(repoUrl, requiredIuIds, 0);
+    }
 
-        PluginLogManager.getLog().info("Fetching P2 metadata from: " + repoUrl);
+    private static P2ResolverResult resolveFromRepository(
+            String repoUrl, Set<String> requiredIuIds, int depth) throws Exception {
 
-        String contentJarUrl = repoUrl + "/content.jar";
-        String artifactsJarUrl = repoUrl + "/artifacts.jar";
+        String base = repoUrl.endsWith("/") ? repoUrl : repoUrl + "/";
+        PluginLogManager.getLog().info("Fetching P2 metadata from: " + base);
 
-        // Download content.jar and artifacts.jar, record their checksums
-        Path contentJarTmp = downloadToTemp(contentJarUrl);
+        // Try simple repo first (content.jar)
+        Path contentJarTmp = downloadToTempIfExists(base + "content.jar");
+        if (contentJarTmp != null) {
+            return resolveSimpleRepository(base, repoUrl, contentJarTmp, requiredIuIds);
+        }
+
+        // Fall back to composite repo (compositeContent.jar)
+        Path compositeJarTmp = downloadToTempIfExists(base + "compositeContent.jar");
+        if (compositeJarTmp != null) {
+            if (depth >= MAX_COMPOSITE_DEPTH) {
+                Files.deleteIfExists(compositeJarTmp);
+                throw new IOException("Max composite depth reached for: " + base);
+            }
+            return resolveCompositeRepository(base, compositeJarTmp, requiredIuIds, depth);
+        }
+
+        throw new IOException("No content.jar or compositeContent.jar found at: " + base);
+    }
+
+    /**
+     * Resolves a simple (non-composite) P2 repository that has content.jar + artifacts.jar.
+     */
+    private static P2ResolverResult resolveSimpleRepository(
+            String base, String repoUrl, Path contentJarTmp, Set<String> requiredIuIds)
+            throws Exception {
+
+        String contentJarUrl = base + "content.jar";
+        String artifactsJarUrl = base + "artifacts.jar";
+
         String contentJarChecksum = computeChecksum(contentJarTmp);
 
         Path artifactsJarTmp = downloadToTemp(artifactsJarUrl);
         String artifactsJarChecksum = computeChecksum(artifactsJarTmp);
 
-        // Build P2Repository entry
         String localPath = "p2/" + slugify(repoUrl);
         P2Repository p2Repo = new P2Repository(
                 repoUrl, contentJarUrl, contentJarChecksum,
                 artifactsJarUrl, artifactsJarChecksum, localPath);
 
-        // Parse IU dependency graph from content.jar
         Map<String, IuMetadata> iuGraph = parseContentMetadata(contentJarTmp);
         Files.deleteIfExists(contentJarTmp);
 
-        // Parse artifact download mappings from artifacts.jar
         Map<String, ArtifactMetadata> artifactMap = parseArtifactMetadata(artifactsJarTmp);
         Files.deleteIfExists(artifactsJarTmp);
 
@@ -207,45 +235,89 @@ public class P2Resolver {
             String iuId = queue.poll();
             if (resolved.contains(iuId)) continue;
             resolved.add(iuId);
-
             IuMetadata iu = iuGraph.get(iuId);
             if (iu != null) {
                 for (String dep : iu.requirements) {
-                    if (!resolved.contains(dep)) {
-                        queue.add(dep);
-                    }
+                    if (!resolved.contains(dep)) queue.add(dep);
                 }
             }
         }
 
-        // Build result nodes — use checksums from artifacts.xml (no per-artifact download needed)
         List<P2DependencyNode> nodes = new ArrayList<>();
         for (String iuId : resolved) {
             ArtifactMetadata artifact = artifactMap.get(iuId);
-            if (artifact == null) continue; // meta-IU with no downloadable artifact
+            if (artifact == null) continue;
 
             String downloadUrl = buildDownloadUrl(repoUrl, artifact);
-            String mirrorPath = artifact.classifier + "s/" + iuId + "_" + artifact.version + artifact.extension;
-
-            // P2 artifacts.xml already contains SHA-256 checksums — use them directly
-            // to avoid downloading every artifact just for checksum computation.
-            String checksum = artifact.p2Checksum;
-            String checksumAlgorithm = artifact.p2ChecksumAlgorithm;
+            String folder = "osgi.bundle".equals(artifact.classifier) ? "plugins" : "features";
+            String mirrorPath = folder + "/" + iuId + "_" + artifact.version + artifact.extension;
 
             PluginLogManager.getLog().debug("Resolved P2 artifact: " + iuId + ":" + artifact.version);
             nodes.add(new P2DependencyNode(
-                    artifact.classifier,
-                    iuId,
-                    artifact.version,
-                    downloadUrl,
-                    repoUrl,
-                    mirrorPath,
-                    checksumAlgorithm,
-                    checksum));
+                    artifact.classifier, iuId, artifact.version,
+                    downloadUrl, repoUrl, mirrorPath,
+                    artifact.p2ChecksumAlgorithm, artifact.p2Checksum));
         }
         PluginLogManager.getLog().info(String.format(
                 "Resolved %d P2 artifact(s) from %s", nodes.size(), repoUrl));
         return new P2ResolverResult(nodes, List.of(p2Repo));
+    }
+
+    /**
+     * Resolves a composite P2 repository by parsing its child repo URLs and
+     * recursively resolving each child.
+     */
+    private static P2ResolverResult resolveCompositeRepository(
+            String base, Path compositeJarTmp, Set<String> requiredIuIds, int depth)
+            throws Exception {
+
+        PluginLogManager.getLog().info("Resolving composite P2 repo: " + base);
+        List<String> children = parseCompositeChildren(compositeJarTmp, base);
+        Files.deleteIfExists(compositeJarTmp);
+
+        List<P2DependencyNode> allArtifacts = new ArrayList<>();
+        List<P2Repository> allRepos = new ArrayList<>();
+
+        for (String childUrl : children) {
+            try {
+                P2ResolverResult childResult =
+                        resolveFromRepository(childUrl, requiredIuIds, depth + 1);
+                allArtifacts.addAll(childResult.getArtifacts());
+                allRepos.addAll(childResult.getRepositories());
+            } catch (Exception e) {
+                PluginLogManager.getLog().warn(
+                        "Failed to resolve composite child " + childUrl + ": " + e.getMessage());
+            }
+        }
+        return new P2ResolverResult(allArtifacts, allRepos);
+    }
+
+    /**
+     * Parses compositeContent.jar and returns the resolved child repository URLs.
+     * Child locations may be relative (resolved against {@code base}) or absolute.
+     */
+    private static List<String> parseCompositeChildren(Path compositeJarTmp, String base)
+            throws Exception {
+        Document doc = parseP2Xml(compositeJarTmp, "compositeContent.xml");
+        List<String> children = new ArrayList<>();
+        NodeList childNodes = doc.getElementsByTagName("child");
+        for (int i = 0; i < childNodes.getLength(); i++) {
+            String location = ((Element) childNodes.item(i)).getAttribute("location");
+            if (location == null || location.isEmpty()) continue;
+            String childUrl;
+            if (location.startsWith("http://") || location.startsWith("https://")
+                    || location.startsWith("file://")) {
+                childUrl = location;
+            } else {
+                // Relative location — resolve against base URL
+                childUrl = URI.create(base).resolve(location).toString();
+            }
+            PluginLogManager.getLog().debug("Composite child: " + childUrl);
+            children.add(childUrl);
+        }
+        PluginLogManager.getLog().info(String.format(
+                "Composite repo %s has %d child(ren)", base, children.size()));
+        return children;
     }
 
     // -------------------------------------------------------------------------
@@ -375,6 +447,32 @@ public class P2Resolver {
         HttpURLConnection conn = (HttpURLConnection) URI.create(url).toURL().openConnection();
         conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
         conn.setReadTimeout(READ_TIMEOUT_MS);
+        try (InputStream in = conn.getInputStream()) {
+            Files.copy(in, tmp, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+        } finally {
+            conn.disconnect();
+        }
+        return tmp;
+    }
+
+    /**
+     * Like {@link #downloadToTemp} but returns {@code null} instead of throwing
+     * when the server returns HTTP 404. Other errors still throw.
+     */
+    private static Path downloadToTempIfExists(String url) throws IOException {
+        HttpURLConnection conn = (HttpURLConnection) URI.create(url).toURL().openConnection();
+        conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
+        conn.setReadTimeout(READ_TIMEOUT_MS);
+        int status = conn.getResponseCode();
+        if (status == 404) {
+            conn.disconnect();
+            return null;
+        }
+        if (status / 100 != 2) {
+            conn.disconnect();
+            throw new IOException("HTTP " + status + " fetching " + url);
+        }
+        Path tmp = Files.createTempFile("maven-lockfile-p2-", ".tmp");
         try (InputStream in = conn.getInputStream()) {
             Files.copy(in, tmp, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
         } finally {

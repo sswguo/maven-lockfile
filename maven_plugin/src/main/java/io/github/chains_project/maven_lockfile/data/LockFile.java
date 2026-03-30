@@ -50,6 +50,13 @@ public class LockFile {
 
     private final List<P2Repository> p2Repositories;
 
+    /**
+     * Extra artifacts discovered by {@code ExtraArtifactResolver} — artifacts Maven needs for
+     * offline dependency resolution (e.g. POM-only metadata lookups for conflict-loser versions)
+     * that are not captured in the regular dependency tree or plugin dependency resolution.
+     */
+    private final List<DependencyNode> extraDependencies;
+
     private final MetaData metaData;
 
     public LockFile(
@@ -92,6 +99,23 @@ public class LockFile {
             List<P2DependencyNode> p2Dependencies,
             List<P2Repository> p2Repositories,
             MetaData metaData) {
+        this(groupId, name, versionNumber, pom, dependencies, mavenPlugins, boms, extensions,
+                p2Dependencies, p2Repositories, Collections.emptyList(), metaData);
+    }
+
+    public LockFile(
+            GroupId groupId,
+            ArtifactId name,
+            VersionNumber versionNumber,
+            Pom pom,
+            Set<DependencyNode> dependencies,
+            Set<MavenPlugin> mavenPlugins,
+            Set<Pom> boms,
+            Set<Extension> extensions,
+            List<P2DependencyNode> p2Dependencies,
+            List<P2Repository> p2Repositories,
+            List<DependencyNode> extraDependencies,
+            MetaData metaData) {
         this.groupId = groupId;
         this.name = name;
         this.version = versionNumber;
@@ -102,6 +126,7 @@ public class LockFile {
         this.extensions = extensions == null ? Collections.emptySet() : extensions;
         this.p2Dependencies = p2Dependencies == null ? Collections.emptyList() : p2Dependencies;
         this.p2Repositories = p2Repositories == null ? Collections.emptyList() : p2Repositories;
+        this.extraDependencies = extraDependencies == null ? Collections.emptyList() : extraDependencies;
         this.metaData = metaData;
     }
     /**
@@ -164,6 +189,10 @@ public class LockFile {
 
     public List<P2Repository> getP2Repositories() {
         return p2Repositories == null ? Collections.emptyList() : p2Repositories;
+    }
+
+    public List<DependencyNode> getExtraDependencies() {
+        return extraDependencies == null ? Collections.emptyList() : extraDependencies;
     }
     /**
      * @return the metadata about the environment in which the lock file was generated

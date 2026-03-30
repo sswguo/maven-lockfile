@@ -74,9 +74,18 @@ public class DependencyGraph {
     private void populateChildrenForConflictLosersRecursive(
             DependencyNode node, Function<DependencyNode, Set<DependencyNode>> childrenProvider) {
         if (!node.isIncluded() && node.getChildren().isEmpty()) {
+            // Skip duplicates: selectedVersion == version means Maven found the same artifact
+            // via two paths ("omitted for duplicate"). The JAR is already captured by the
+            // winning node — no need to re-resolve.
+            boolean isTrueVersionConflict = node.getSelectedVersion() != null
+                    && !node.getSelectedVersion().equals(node.getVersion().getValue());
+            if (!isTrueVersionConflict) {
+                return;
+            }
             PluginLogManager.getLog().debug(String.format(
-                    "Resolving children for conflict-loser node %s:%s:%s",
-                    node.getGroupId().getValue(), node.getArtifactId().getValue(), node.getVersion().getValue()));
+                    "Resolving children for conflict-loser node %s:%s:%s (winner: %s)",
+                    node.getGroupId().getValue(), node.getArtifactId().getValue(),
+                    node.getVersion().getValue(), node.getSelectedVersion()));
             Set<DependencyNode> children = childrenProvider.apply(node);
             for (DependencyNode child : children) {
                 try {

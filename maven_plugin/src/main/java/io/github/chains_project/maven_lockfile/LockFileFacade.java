@@ -24,9 +24,13 @@ import io.github.chains_project.maven_lockfile.resolvers.PlatformArtifactResolve
 import io.github.chains_project.maven_lockfile.resolvers.ProjectBuilder;
 import io.github.chains_project.maven_lockfile.resolvers.ProtobufMavenPluginResolver;
 import io.github.chains_project.maven_lockfile.resolvers.QuarkusDeploymentResolver;
+import io.github.chains_project.maven_lockfile.resolvers.ExtraArtifactResolver;
 import io.github.chains_project.maven_lockfile.resolvers.MavenCompilerPluginResolver;
 import io.github.chains_project.maven_lockfile.resolvers.SpecialPluginResolver;
 import io.github.chains_project.maven_lockfile.resolvers.SurefirePluginResolver;
+import org.eclipse.aether.DefaultRepositorySystemSession;
+import org.eclipse.aether.RepositorySystem;
+import org.eclipse.aether.resolution.ArtifactResolutionException;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -118,7 +122,7 @@ public class LockFileFacade {
             MetaData metadata) {
         return generateLockFileFromProject(
                 session, project, dependencyCollectorBuilder, checksumCalculator, metadata,
-                Collections.emptyList());
+                Collections.emptyList(), null);
     }
 
     public static LockFile generateLockFileFromProject(
@@ -128,7 +132,26 @@ public class LockFileFacade {
             AbstractChecksumCalculator checksumCalculator,
             MetaData metadata,
             List<String> platformArtifactSpecs) {
+        return generateLockFileFromProject(
+                session, project, dependencyCollectorBuilder, checksumCalculator, metadata,
+                platformArtifactSpecs, null);
+    }
+
+    public static LockFile generateLockFileFromProject(
+            MavenSession session,
+            MavenProject project,
+            DependencyCollectorBuilder dependencyCollectorBuilder,
+            AbstractChecksumCalculator checksumCalculator,
+            MetaData metadata,
+            List<String> platformArtifactSpecs,
+            RepositorySystem repositorySystem) {
         PluginLogManager.getLog().info(String.format("Generating lock file for project %s", project.getArtifactId()));
+
+        // Phase 1: create a mutable session copy with a recording RepositoryListener attached.
+        // The mutable session is injected into every ProjectBuildingRequest so that
+        // artifactResolved fires for each POM/artifact resolved — warm cache or cold cache.
+        ExtraArtifactResolver.Tracker extraTracker = ExtraArtifactResolver.createTracker(session, project);
+        DefaultRepositorySystemSession mutableSession = extraTracker.getMutableSession();
 
         // Create resolvers once so their projectCache/pomChainCache/bomsCache are shared
         // across all resolveNodeParents() calls — avoids redundant buildFromGav() invocations
@@ -142,11 +165,11 @@ public class LockFileFacade {
 
         Set<MavenPlugin> plugins = new TreeSet<>();
         if (metadata.getConfig().isIncludeMavenPlugins()) {
-            plugins = getAllPlugins(project, session, dependencyCollectorBuilder, checksumCalculator, pluginResolver);
+            plugins = getAllPlugins(project, session, dependencyCollectorBuilder, checksumCalculator, pluginResolver, mutableSession, repositorySystem);
         }
 
         var graph = buildDependencyGraph(session, project, dependencyCollectorBuilder, checksumCalculator,
-                metadata.getConfig().isReduced());
+                metadata.getConfig().isReduced(), mutableSession, repositorySystem, artifactResolver);
 
         // Pre-warm: parallel buildFromGav for all dep nodes, then parallel HTTP for all parent POMs.
         // The sequential resolve() pass then hits only in-memory caches.
@@ -196,6 +219,20 @@ public class LockFileFacade {
                     p2Dependencies.size(), p2Repositories.size()));
         }
 
+        Set<Pom> boms = resolveBoms(session, project, checksumCalculator);
+        Set<Extension> extensions = resolveExtensions(
+                session, project, dependencyCollectorBuilder, checksumCalculator, pluginResolver, mutableSession, repositorySystem);
+
+        // Resolve annotation processors (and any other forceDependencyPopulation resolvers)
+        // as standalone roots so their full unmediated transitive closure is captured.
+        resolveSpecialPluginDependencies(project, session, dependencyCollectorBuilder,
+                checksumCalculator, pluginResolver, mutableSession, repositorySystem, allRoots);
+
+        // Phase 2: extract extras — apply GAV-level dedup and build DependencyNode entries.
+        Set<String> alreadyRecordedGavs = buildRecordedGavs(allRoots, plugins, boms, extensions);
+        List<io.github.chains_project.maven_lockfile.graph.DependencyNode> extraDependencies =
+                ExtraArtifactResolver.extractExtras(extraTracker, alreadyRecordedGavs, checksumCalculator);
+
         return new LockFile(
                 GroupId.of(project.getGroupId()),
                 ArtifactId.of(project.getArtifactId()),
@@ -203,10 +240,11 @@ public class LockFileFacade {
                 constructProjectPomChain(project, checksumCalculator),
                 allRoots,
                 plugins,
-                resolveBoms(session, project, checksumCalculator),
-                resolveExtensions(session, project, dependencyCollectorBuilder, checksumCalculator, pluginResolver),
+                boms,
+                extensions,
                 p2Dependencies,
                 p2Repositories,
+                extraDependencies,
                 metadata);
     }
 
@@ -215,7 +253,9 @@ public class LockFileFacade {
             MavenProject project,
             DependencyCollectorBuilder dependencyCollectorBuilder,
             AbstractChecksumCalculator checksumCalculator,
-            NodeParentResolver pluginResolver) {
+            NodeParentResolver pluginResolver,
+            DefaultRepositorySystemSession aetherSession,
+            RepositorySystem repositorySystem) {
         var buildExtensions = project.getBuild().getExtensions();
         PluginLogManager.getLog().info(String.format(
                 "Resolving %d build extension(s) for project %s", buildExtensions.size(), project.getArtifactId()));
@@ -235,7 +275,7 @@ public class LockFileFacade {
             String checksum = checksumCalculator.calculatePluginChecksum(artifact);
             Set<io.github.chains_project.maven_lockfile.graph.DependencyNode> deps =
                     resolvePluginDependencies(artifact, session, project, dependencyCollectorBuilder, checksumCalculator,
-                            Collections.emptyList(), pluginResolver);
+                            Collections.emptyList(), pluginResolver, aetherSession, repositorySystem);
 
             Optional<MavenProject> extProjectOpt = projectBuilder.buildFromGav(
                     ext.getGroupId(), ext.getArtifactId(), ext.getVersion());
@@ -405,12 +445,214 @@ public class LockFileFacade {
         }
     }
 
+    /**
+     * For every {@link SpecialPluginResolver} that returns {@code true} from
+     * {@link SpecialPluginResolver#forceDependencyPopulation()}, resolves each discovered
+     * dependency as a <em>standalone root</em> — not as a dep of its plugin.
+     *
+     * <p>This bypasses Maven's plugin-context conflict mediation so the full, unmediated
+     * transitive closure of each artifact is captured. Needed for annotation processors
+     * declared in {@code <annotationProcessorPaths>} whose classloader is independent of
+     * the project's dependency graph — every artifact must be present regardless of the
+     * project-level conflict winner.
+     *
+     * <p>Results are added directly to {@code allRoots} so hermeto pre-fetches them.
+     */
+    private static void resolveSpecialPluginDependencies(
+            MavenProject project,
+            MavenSession session,
+            DependencyCollectorBuilder dependencyCollectorBuilder,
+            AbstractChecksumCalculator checksumCalculator,
+            NodeParentResolver pluginResolver,
+            DefaultRepositorySystemSession aetherSession,
+            RepositorySystem repositorySystem,
+            Set<io.github.chains_project.maven_lockfile.graph.DependencyNode> allRoots) {
+
+        for (SpecialPluginResolver resolver : PLUGIN_RESOLVERS) {
+            if (!resolver.isApplicable(project)) continue;
+            if (!resolver.forceDependencyPopulation()) continue;
+
+            SpecialPluginResolver.DiscoveryResult result = resolver.discover(project, session);
+            if (result.isEmpty()) continue;
+
+            PluginLogManager.getLog().info(String.format(
+                    "%s: force-resolving discovered artifacts as standalone roots",
+                    resolver.getDisplayName()));
+
+            for (List<Dependency> deps : result.getPluginDependencies().values()) {
+                for (Dependency dep : deps) {
+                    Artifact artifact = new DefaultArtifact(
+                            dep.getGroupId(), dep.getArtifactId(), dep.getVersion(),
+                            "compile", "jar", null, new DefaultArtifactHandler("jar"));
+                    Set<io.github.chains_project.maven_lockfile.graph.DependencyNode> nodes =
+                            resolvePluginDependencies(
+                                    artifact, session, project, dependencyCollectorBuilder,
+                                    checksumCalculator, Collections.emptyList(),
+                                    pluginResolver, aetherSession, repositorySystem);
+                    allRoots.addAll(nodes);
+                    PluginLogManager.getLog().debug(String.format(
+                            "%s: added %d node(s) for %s:%s:%s",
+                            resolver.getDisplayName(), nodes.size(),
+                            dep.getGroupId(), dep.getArtifactId(), dep.getVersion()));
+                }
+            }
+        }
+    }
+
+    /**
+     * Converts a list of Maven {@link org.apache.maven.artifact.repository.ArtifactRepository}
+     * entries into Aether {@link org.eclipse.aether.repository.RemoteRepository} objects.
+     */
+    @SuppressWarnings("deprecation")
+    private static List<org.eclipse.aether.repository.RemoteRepository> toAetherRemoteRepos(
+            List<org.apache.maven.artifact.repository.ArtifactRepository> repos) {
+        List<org.eclipse.aether.repository.RemoteRepository> result = new ArrayList<>();
+        for (org.apache.maven.artifact.repository.ArtifactRepository repo : repos) {
+            result.add(new org.eclipse.aether.repository.RemoteRepository.Builder(
+                    repo.getId(), "default", repo.getUrl()).build());
+        }
+        return result;
+    }
+
+    /**
+     * Calls Aether {@link RepositorySystem#resolveArtifacts} for every node in {@code nodes}
+     * through the mutable session so that our {@link org.eclipse.aether.RepositoryListener}
+     * fires for every JAR artifact during the main resolution pass — not only for the POMs
+     * resolved by {@code collectDependencyGraph}.
+     *
+     * <p>All artifacts are already in the local cache at this point, so this is a warm-cache
+     * pass with no network calls. Partial failures (e.g. reactor artifacts with no remote URL)
+     * are logged at DEBUG level and ignored.
+     */
+    private static void resolveArtifactsThroughMutableSession(
+            RepositorySystem repositorySystem,
+            DefaultRepositorySystemSession aetherSession,
+            Collection<DependencyNode> nodes,
+            List<org.eclipse.aether.repository.RemoteRepository> remoteRepos) {
+
+        List<org.eclipse.aether.resolution.ArtifactRequest> requests = new ArrayList<>();
+        for (DependencyNode node : nodes) {
+            Artifact a = node.getArtifact();
+            if (a == null || a.getGroupId() == null || a.getVersion() == null) continue;
+            requests.add(new org.eclipse.aether.resolution.ArtifactRequest(
+                    new org.eclipse.aether.artifact.DefaultArtifact(
+                            a.getGroupId(), a.getArtifactId(),
+                            a.getClassifier(), a.getArtifactHandler().getExtension(),
+                            a.getVersion()),
+                    remoteRepos, null));
+        }
+        if (requests.isEmpty()) return;
+
+        try {
+            repositorySystem.resolveArtifacts(aetherSession, requests);
+            PluginLogManager.getLog().debug(String.format(
+                    "ExtraArtifacts: resolved %d artifact(s) through mutable session (listener pass)",
+                    requests.size()));
+        } catch (org.eclipse.aether.resolution.ArtifactResolutionException e) {
+            // Partial failures are expected for reactor-local or optional artifacts.
+            // artifactResolved fires per-artifact regardless of overall exception.
+            PluginLogManager.getLog().debug(
+                    "ExtraArtifacts: resolveArtifacts partial failures (expected for local/optional): "
+                            + e.getMessage());
+        }
+    }
+
+    /**
+     * Builds a set of {@code groupId:artifactId:version} GAV triples for all artifacts already
+     * recorded in the lockfile (dependencies + plugin artifacts + plugin deps). Used by
+     * {@link ExtraArtifactResolver#extractExtras} to skip artifacts that are already captured.
+     *
+     * <p>GAV-level (no type/classifier) so that POM transfers for JARs already in the lockfile
+     * are also filtered — e.g. {@code g:a:1.0:pom:} is skipped when {@code g:a:1.0:jar:} is
+     * already recorded.
+     */
+    private static Set<String> buildRecordedGavs(
+            Set<io.github.chains_project.maven_lockfile.graph.DependencyNode> roots,
+            Set<MavenPlugin> plugins,
+            Set<Pom> boms,
+            Set<Extension> extensions) {
+        Set<String> recorded = new HashSet<>();
+
+        // Dependency graph — all direct + transitive deps (recursive tree walk).
+        for (io.github.chains_project.maven_lockfile.graph.DependencyNode node : roots) {
+            collectNodeGavs(node, recorded);
+        }
+
+        // Plugins: the plugin artifact itself, its declared dependencies, its POM chain,
+        // and its BOM imports (all of which Maven reads and whose artifactResolved fires).
+        for (MavenPlugin plugin : plugins) {
+            String pg = plugin.getGroupId().getValue();
+            String pa = plugin.getArtifactId().getValue();
+            String pv = plugin.getVersion().getValue();
+            recorded.add(pg + ":" + pa + ":" + pv + ":jar");
+            recorded.add(pg + ":" + pa + ":" + pv + ":pom");
+            for (io.github.chains_project.maven_lockfile.graph.DependencyNode dep :
+                    plugin.getDependencies()) {
+                collectNodeGavs(dep, recorded);
+            }
+            collectPomChainGavs(plugin.getPom(), recorded);
+            if (plugin.getBoms() != null) {
+                for (Pom pluginBom : plugin.getBoms()) {
+                    collectPomChainGavs(pluginBom, recorded);
+                }
+            }
+        }
+
+        // BOMs listed in dependencyManagement — their full parent chains are also resolved.
+        for (Pom bom : boms) {
+            collectPomChainGavs(bom, recorded);
+        }
+
+        // Build extensions + their transitive dependency nodes.
+        for (Extension ext : extensions) {
+            String eg = ext.getGroupId().getValue();
+            String ea = ext.getArtifactId().getValue();
+            String ev = ext.getVersion().getValue();
+            recorded.add(eg + ":" + ea + ":" + ev + ":jar");
+            recorded.add(eg + ":" + ea + ":" + ev + ":pom");
+            for (io.github.chains_project.maven_lockfile.graph.DependencyNode dep :
+                    ext.getDependencies()) {
+                collectNodeGavs(dep, recorded);
+            }
+        }
+
+        return recorded;
+    }
+
+    private static void collectNodeGavs(
+            io.github.chains_project.maven_lockfile.graph.DependencyNode node,
+            Set<String> gavs) {
+        String g = node.getGroupId().getValue();
+        String a = node.getArtifactId().getValue();
+        String v = node.getVersion().getValue();
+        // ArtifactType.of("jar") returns null — null means jar.
+        String type = node.getType() != null ? node.getType().getValue() : "jar";
+        gavs.add(g + ":" + a + ":" + v + ":" + type);
+        // Also register the POM type: hermeto auto-downloads the POM for every JAR artifact,
+        // so we pre-filter it here to avoid a redundant extraDependencies entry.
+        gavs.add(g + ":" + a + ":" + v + ":pom");
+        for (io.github.chains_project.maven_lockfile.graph.DependencyNode child :
+                node.getChildren()) {
+            collectNodeGavs(child, gavs);
+        }
+    }
+
+    /** Walks the {@link Pom} parent chain and adds each entry's GAVT ({@code :pom}) to the given set. */
+    private static void collectPomChainGavs(Pom pom, Set<String> gavs) {
+        for (Pom p = pom; p != null; p = p.getParent()) {
+            gavs.add(p.getGroupId().getValue() + ":" + p.getArtifactId().getValue()
+                    + ":" + p.getVersion().getValue() + ":pom");
+        }
+    }
+
     private static Set<MavenPlugin> getAllPlugins(
             MavenProject project,
             MavenSession session,
             DependencyCollectorBuilder dependencyCollectorBuilder,
             AbstractChecksumCalculator checksumCalculator,
-            NodeParentResolver pluginResolver) {
+            NodeParentResolver pluginResolver,
+            DefaultRepositorySystemSession aetherSession,
+            RepositorySystem repositorySystem) {
         Set<MavenPlugin> plugins = new TreeSet<>();
 
         // originalUserPluginDeps: only what the project's pom.xml declares for each plugin.
@@ -478,16 +720,16 @@ public class LockFileFacade {
                 // newer versions of the same artifact.
                 Set<io.github.chains_project.maven_lockfile.graph.DependencyNode> nativeDeps =
                         resolvePluginDependencies(pluginArtifact, session, project,
-                                dependencyCollectorBuilder, checksumCalculator, originalDeps, pluginResolver);
+                                dependencyCollectorBuilder, checksumCalculator, originalDeps, pluginResolver, aetherSession, repositorySystem);
                 Set<io.github.chains_project.maven_lockfile.graph.DependencyNode> extendedDeps =
                         resolvePluginDependencies(pluginArtifact, session, project,
-                                dependencyCollectorBuilder, checksumCalculator, allDeps, pluginResolver);
+                                dependencyCollectorBuilder, checksumCalculator, allDeps, pluginResolver, aetherSession, repositorySystem);
                 pluginDependencies = new HashSet<>(nativeDeps);
                 pluginDependencies.addAll(extendedDeps);
             } else {
                 pluginDependencies = resolvePluginDependencies(
                         pluginArtifact, session, project, dependencyCollectorBuilder,
-                        checksumCalculator, allDeps, pluginResolver);
+                        checksumCalculator, allDeps, pluginResolver, aetherSession, repositorySystem);
             }
             Optional<MavenProject> pluginProjectOpt = pluginProjectBuilder.buildFromGav(
                     pluginArtifact.getGroupId(), pluginArtifact.getArtifactId(), pluginArtifact.getBaseVersion());
@@ -526,7 +768,9 @@ public class LockFileFacade {
             DependencyCollectorBuilder dependencyCollectorBuilder,
             AbstractChecksumCalculator checksumCalculator,
             List<Dependency> userDeclaredDeps,
-            NodeParentResolver pluginResolver) {
+            NodeParentResolver pluginResolver,
+            DefaultRepositorySystemSession aetherSession,
+            RepositorySystem repositorySystem) {
         PluginLogManager.getLog()
                 .debug(String.format("Attempting to resolve dependencies for plugin %s", pluginArtifact));
         try {
@@ -558,6 +802,9 @@ public class LockFileFacade {
                     new DefaultProjectBuildingRequest(session.getProjectBuildingRequest());
             dependencyBuildingRequest.setProject(pluginProject);
             dependencyBuildingRequest.setRemoteRepositories(project.getPluginArtifactRepositories());
+            if (aetherSession != null) {
+                dependencyBuildingRequest.setRepositorySession(aetherSession);
+            }
 
             // Filter artifacts to "compile+runtime" scopes. Maven plugins require their runtime
             // scope dependencies to be present alongside any compile-time dependencies.
@@ -583,11 +830,19 @@ public class LockFileFacade {
             DependencyGraph dependencyGraph = DependencyGraph.of(graph, checksumCalculator, false);
             resolveNodeParents(dependencyGraph, pluginResolver);
 
+            // Resolve plugin JAR artifacts through the mutable Aether session so our
+            // RepositoryListener fires for every plugin dependency JAR.
+            if (repositorySystem != null && aetherSession != null) {
+                resolveArtifactsThroughMutableSession(
+                        repositorySystem, aetherSession, graph.nodes(),
+                        toAetherRemoteRepos(project.getPluginArtifactRepositories()));
+            }
+
             // Conflict-loser nodes have their subtrees pruned by Maven's resolver, but their
-            // transitive POMs still need to be in the local repo for offline resolution. Resolve
-            // each loser's subtree independently so hermeto can pre-fetch them.
+            // transitive JARs and POMs still need to be in the local repo for offline builds.
+            // Resolve each loser's subtree independently so hermeto can pre-fetch them.
             final Set<String> resolvingLosers = new HashSet<>();
-           /* dependencyGraph.populateChildrenForConflictLosers(loserNode -> {
+            /*dependencyGraph.populateChildrenForConflictLosers(loserNode -> {
                 String gav = loserNode.getGroupId().getValue() + ":"
                         + loserNode.getArtifactId().getValue() + ":"
                         + loserNode.getVersion().getValue();
@@ -604,7 +859,8 @@ public class LockFileFacade {
                         null,
                         new DefaultArtifactHandler("jar"));
                 return resolvePluginDependencies(
-                        loserArtifact, session, project, dependencyCollectorBuilder, checksumCalculator, Collections.emptyList(), pluginResolver);
+                        loserArtifact, session, project, dependencyCollectorBuilder, checksumCalculator,
+                        Collections.emptyList(), pluginResolver, aetherSession, repositorySystem);
             });*/
 
             Set<io.github.chains_project.maven_lockfile.graph.DependencyNode> roots = dependencyGraph.getRoots();
@@ -657,7 +913,10 @@ public class LockFileFacade {
             MavenProject project,
             DependencyCollectorBuilder dependencyCollectorBuilder,
             AbstractChecksumCalculator checksumCalculator,
-            boolean reduced) {
+            boolean reduced,
+            DefaultRepositorySystemSession aetherSession,
+            RepositorySystem repositorySystem,
+            NodeParentResolver artifactResolver) {
         try {
             // Build the reactor sibling GAV set before collection.
             Set<String> reactorGavs = session.getProjects().stream()
@@ -669,6 +928,9 @@ public class LockFileFacade {
             ProjectBuildingRequest buildingRequest =
                     new DefaultProjectBuildingRequest(session.getProjectBuildingRequest());
             buildingRequest.setProject(project);
+            if (aetherSession != null) {
+                buildingRequest.setRepositorySession(aetherSession);
+            }
 
             var rootNode = dependencyCollectorBuilder.collectDependencyGraph(buildingRequest, null);
 
@@ -679,9 +941,43 @@ public class LockFileFacade {
                             "Resolved %4d dependencies for project %s",
                             graph.nodes().size(), project));
 
+            // Resolve all JAR artifacts through the mutable Aether session so our
+            // RepositoryListener fires for every dependency JAR — not only for the POMs
+            // resolved during collectDependencyGraph above.
+            if (repositorySystem != null && aetherSession != null) {
+                resolveArtifactsThroughMutableSession(
+                        repositorySystem, aetherSession, graph.nodes(),
+                        toAetherRemoteRepos(project.getRemoteArtifactRepositories()));
+            }
+
             // Reactor nodes are now in the graph but have no remote URL — exclude them from
             // the lockfile output. Their transitive deps (all external) remain included.
-            return DependencyGraph.of(graph, checksumCalculator, reduced, reactorGavs);
+            DependencyGraph dependencyGraph = DependencyGraph.of(graph, checksumCalculator, reduced, reactorGavs);
+
+            // Conflict-loser nodes have their subtrees pruned by Maven's resolver, but their
+            // transitive JARs and POMs still need to be in the local repo for offline builds.
+            // Resolve each loser's subtree independently so hermeto can pre-fetch them.
+            if (artifactResolver != null) {
+                final Set<String> resolvingLosers = new HashSet<>();
+                dependencyGraph.populateChildrenForConflictLosers(loserNode -> {
+                    String gav = loserNode.getGroupId().getValue() + ":"
+                            + loserNode.getArtifactId().getValue() + ":"
+                            + loserNode.getVersion().getValue();
+                    if (!resolvingLosers.add(gav)) {
+                        return Collections.emptySet();
+                    }
+                    Artifact loserArtifact = new DefaultArtifact(
+                            loserNode.getGroupId().getValue(),
+                            loserNode.getArtifactId().getValue(),
+                            loserNode.getVersion().getValue(),
+                            "compile", "jar", null, new DefaultArtifactHandler("jar"));
+                    return resolvePluginDependencies(
+                            loserArtifact, session, project, dependencyCollectorBuilder, checksumCalculator,
+                            Collections.emptyList(), artifactResolver, aetherSession, repositorySystem);
+                });
+            }
+
+            return dependencyGraph;
         } catch (Exception e) {
             PluginLogManager.getLog().warn("Could not generate graph", e);
             return DependencyGraph.of(GraphBuilder.directed().build(), checksumCalculator, reduced);

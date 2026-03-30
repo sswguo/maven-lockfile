@@ -62,6 +62,14 @@ public class MavenCompilerPluginResolver extends SpecialPluginResolver {
     }
 
     @Override
+    public boolean forceDependencyPopulation() {
+        // Annotation processors run in a separate classloader — Maven's main conflict
+        // resolution does not apply. Every artifact (including "duplicates") must be
+        // present in the local repo for a hermetic offline build.
+        return true;
+    }
+
+    @Override
     public DiscoveryResult discover(MavenProject project, MavenSession session) {
         List<Dependency> deps = discoverAnnotationProcessors(project);
         if (deps.isEmpty()) {

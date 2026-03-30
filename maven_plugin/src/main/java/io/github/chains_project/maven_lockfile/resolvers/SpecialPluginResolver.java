@@ -48,6 +48,20 @@ public abstract class SpecialPluginResolver {
     public abstract DiscoveryResult discover(MavenProject project, MavenSession session);
 
     /**
+     * Returns {@code true} if conflict-loser nodes — including duplicates
+     * ({@code selectedVersion == version}) — should have their children populated during
+     * lockfile generation for this plugin's dependency graph.
+     *
+     * <p>Override to {@code true} for plugins whose dependencies are loaded in a separate
+     * classloader (e.g. annotation processors via {@code maven-compiler-plugin}), where
+     * Maven's main dependency mediation does not apply and every resolved artifact must
+     * be available in the local repository regardless of the project-level conflict winner.
+     */
+    public boolean forceDependencyPopulation() {
+        return false;
+    }
+
+    /**
      * Holds the artifacts discovered by a {@link SpecialPluginResolver}, split into two
      * categories that are applied differently in {@code LockFileFacade}:
      *

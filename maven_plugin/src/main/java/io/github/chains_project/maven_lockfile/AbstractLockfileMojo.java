@@ -21,6 +21,7 @@ import org.apache.maven.project.MavenProject;
 import org.apache.maven.project.ProjectBuildingRequest;
 import org.apache.maven.shared.dependency.graph.DependencyCollectorBuilder;
 import org.apache.maven.shared.transfer.dependencies.resolve.DependencyResolver;
+import org.eclipse.aether.RepositorySystem;
 
 public abstract class AbstractLockfileMojo extends AbstractMojo {
 
@@ -41,6 +42,9 @@ public abstract class AbstractLockfileMojo extends AbstractMojo {
 
     @Component
     protected DependencyResolver dependencyResolver;
+
+    @Component
+    protected RepositorySystem repositorySystem;
 
     @Parameter(property = "includeMavenPlugins", defaultValue = "false")
     protected String includeMavenPlugins;
